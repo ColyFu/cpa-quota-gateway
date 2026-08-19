@@ -123,12 +123,20 @@ def init_db():
     }
     for name,sql in migrations.items():
         if name not in columns: c.execute(sql)
-    start,end=calendar_period_bounds(); current=period_key()
     c.execute("UPDATE policies SET cycle_type='fixed_days',cycle_days=30*cycle_months WHERE cycle_months>1 AND cycle_type='calendar_month'")
     c.execute("UPDATE policies SET cycle_months=1")
     c.execute("UPDATE policies SET cycle_type='calendar_month' WHERE cycle_type NOT IN ('calendar_month','fixed_days') OR cycle_type=''")
     c.execute("UPDATE policies SET cycle_days=30 WHERE cycle_days<1")
-    c.execute("UPDATE policies SET period_id=?,period_started_at=?,period_ends_at=? WHERE period_id='' OR period_started_at=0 OR period_ends_at=0",(current,start,end))
+    t=now()
+    for p in c.execute('SELECT * FROM policies').fetchall():
+        start=int(p['period_started_at']); end=int(p['period_ends_at']); pid=p['period_id']
+        if start<=0 or end<=start or not pid:
+            start,end=cycle_bounds(t,p['cycle_type'],p['cycle_days'])
+            pid=period_key(t) if p['cycle_type']=='calendar_month' else f'cycle:{start}'
+            c.execute('UPDATE policies SET period_id=?,period_started_at=?,period_ends_at=? WHERE key_hash=?',(pid,start,end,p['key_hash']))
+        else:
+            expected_end=next_cycle_end(start,p['cycle_type'],p['cycle_days'])
+            if end!=expected_end: c.execute('UPDATE policies SET period_ends_at=? WHERE key_hash=?',(expected_end,p['key_hash']))
     c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('last_price_sync','0')")
     c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('last_key_sync','0')")
     c.close()

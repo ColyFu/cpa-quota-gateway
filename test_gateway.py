@@ -66,6 +66,17 @@ class GatewayTests(unittest.TestCase):
         c=g.db(); c.execute('BEGIN IMMEDIATE'); p=g.ensure_policy(c,g.key_hash('user-a'),'user-a'); c.execute("update policies set cycle_type='fixed_days',cycle_days=7 where key_hash=?",(p['key_hash'],)); reset_at=1788193800
         g.reset_policy_periods(c,[p['key_hash']],reset_at); c.commit(); row=c.execute('select * from policies where key_hash=?',(p['key_hash'],)).fetchone(); c.close()
         self.assertEqual(row['period_ends_at'],reset_at+7*24*60*60)
+    def test_init_normalizes_legacy_period_end_to_cycle_rule(self):
+        reset_at=1788193800; c=g.db(); p=g.ensure_policy(c,g.key_hash('user-a'),'user-a')
+        c.execute('update policies set period_id=?,period_started_at=?,period_ends_at=? where key_hash=?',('old-reset',reset_at,g.add_months(reset_at,1),p['key_hash'])); c.close()
+        g.init_db(); c=g.db(); row=c.execute('select * from policies where key_hash=?',(p['key_hash'],)).fetchone(); c.close()
+        self.assertEqual(row['period_ends_at'],g.calendar_period_bounds(reset_at)[1])
+    def test_init_migrates_multi_month_cycle_to_fixed_days(self):
+        reset_at=1788193800; c=g.db(); p=g.ensure_policy(c,g.key_hash('user-a'),'user-a')
+        c.execute("update policies set cycle_months=3,cycle_type='calendar_month',period_started_at=?,period_ends_at=? where key_hash=?",(reset_at,g.add_months(reset_at,3),p['key_hash'])); c.close()
+        g.init_db(); c=g.db(); row=c.execute('select * from policies where key_hash=?',(p['key_hash'],)).fetchone(); c.close()
+        self.assertEqual((row['cycle_type'],row['cycle_days']),('fixed_days',90))
+        self.assertEqual(row['period_ends_at'],reset_at+90*24*60*60)
     def test_user_limit_only_returns_requested_fields(self):
         c=g.db(); p=g.ensure_policy(c,g.key_hash('user-a'),'user-a'); c.execute('update policies set keeper_active=1 where key_hash=?',(p['key_hash'],)); result=g.user_limit(c,'user-a'); c.close()
         self.assertEqual(set(result),{'limit_usd','used_usd','reset_at','cycle'})
