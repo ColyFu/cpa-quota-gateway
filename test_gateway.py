@@ -1,4 +1,5 @@
-import importlib.util, os, sqlite3, tempfile, unittest
+import importlib.util, io, json, os, sqlite3, tempfile, unittest
+from unittest import mock
 
 os.environ.setdefault('QUOTA_ADMIN_TOKEN','test-token')
 spec=importlib.util.spec_from_file_location('gateway',os.path.join(os.path.dirname(__file__),'gateway.py'))
@@ -28,6 +29,30 @@ class GatewayTests(unittest.TestCase):
             with self.assertRaises(TimeoutError): h.acquire('another-key','model-a',1)
             h.release(rid)
         finally: g.DEFAULT_CONCURRENCY=old
+    def proxy_request(self, status=200, connection_error=None):
+        body=json.dumps({'model':'model-a','max_output_tokens':1}).encode()
+        h=object.__new__(g.Gateway); h.path='/v1/responses'; h.command='POST'; h.request_version='HTTP/1.1'; h.requestline='POST /v1/responses HTTP/1.1'
+        h.headers={'Authorization':'Bearer proxy-key','Content-Length':str(len(body))}; h.rfile=io.BytesIO(body); h.wfile=io.BytesIO(); h.client_address=('127.0.0.1',12345)
+        class Response:
+            def __init__(self): self.status=status; self.body=io.BytesIO(b'upstream response')
+            def getheaders(self): return [('Content-Type','application/json')]
+            def read(self,size=-1): return self.body.read(size)
+        class Connection:
+            def __init__(self,*args,**kwargs): pass
+            def request(self,*args,**kwargs):
+                if connection_error: raise connection_error
+            def getresponse(self): return Response()
+            def close(self): pass
+        with mock.patch.object(g.http.client,'HTTPConnection',Connection): h.proxy()
+        c=g.db(); row=c.execute("SELECT count(*) active FROM reservations WHERE state='active'").fetchone(); period=c.execute("SELECT coalesce(sum(reserved_micro),0) reserved FROM periods").fetchone(); c.close()
+        return row['active'],period['reserved']
+    def test_failed_upstream_response_releases_reservation(self):
+        self.assertEqual(self.proxy_request(status=503),(0,0))
+    def test_successful_upstream_response_keeps_reservation_for_usage(self):
+        active,reserved=self.proxy_request(status=200)
+        self.assertEqual(active,1); self.assertGreater(reserved,0)
+    def test_upstream_connection_error_releases_reservation(self):
+        self.assertEqual(self.proxy_request(connection_error=OSError('connection failed')),(0,0))
     def test_user_reset_starts_independent_cycle(self):
         c=g.db(); c.execute('BEGIN IMMEDIATE'); p=g.ensure_policy(c,g.key_hash('user-a'),'user-a'); reset_at=1788193800
         reset=g.reset_policy_periods(c,[p['key_hash']],reset_at); c.commit()

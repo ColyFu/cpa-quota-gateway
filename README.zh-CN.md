@@ -26,6 +26,7 @@ CLIProxyAPI :8317      -> 实时 usage 事件订阅
 - 每五分钟从 Keeper 同步 API Key、别名和模型价格
 - Keeper 暂时不可用时继续使用最后一次成功同步的缓存
 - 请求转发前原子预占额度，结束后按实际 token 成本结算
+- CLIProxyAPI 返回非成功状态或取得响应前连接失败时立即释放预占，避免失败重试占满并发
 - 支持普通 JSON 响应和 SSE 流式响应
 - SQLite WAL 流水，按 API Key 和请求 ID 防止重复计费
 - 独立管理页面，不修改 Keeper 前端

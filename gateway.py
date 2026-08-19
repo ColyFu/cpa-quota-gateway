@@ -375,10 +375,12 @@ class Gateway(BaseHTTPRequestHandler):
         except TimeoutError as e: json_response(self,429,{'error':{'message':str(e),'type':'rate_limit_error','code':str(e)}},{'Retry-After':'1'}); return
         except ValueError: json_response(self,403,{'error':{'message':'API key disabled','type':'permission_error'}}); return
         except Exception as e: print(f'acquire failed: {e}',file=sys.stderr); json_response(self,503,{'error':{'message':'quota ledger unavailable','type':'server_error'}}); return
+        upstream_status=None; conn=None
         try:
             target=urlsplit(UPSTREAM); path=self.path
             hdr={k:v for k,v in self.headers.items() if k.lower() not in ('host','content-length','connection')}; hdr['Host']=target.netloc; hdr['Content-Length']=str(len(body)); hdr['X-Forwarded-For']=self.client_address[0]
             conn=http.client.HTTPConnection(target.hostname,target.port or 80,timeout=900); conn.request(self.command,path,body=body,headers=hdr); resp=conn.getresponse()
+            upstream_status=resp.status
             self.send_response(resp.status)
             for k,v in resp.getheaders():
                 if k.lower() not in ('connection','transfer-encoding','content-length'): self.send_header(k,v)
@@ -387,12 +389,16 @@ class Gateway(BaseHTTPRequestHandler):
                 b=resp.read(65536)
                 if not b: break
                 self.wfile.write(b); self.wfile.flush()
-            conn.close()
         except Exception as e: print(f'proxy failed: {e}',file=sys.stderr)
         finally:
-            # The usage subscriber settles successful and failed CPA requests.
-            # A stale reservation is released by the next atomic admission.
-            pass
+            if conn:
+                try: conn.close()
+                except Exception: pass
+            # Successful requests remain reserved until their usage event settles them.
+            # CPA failures and pre-response transport errors cannot consume quota.
+            if upstream_status is None or not 200 <= upstream_status < 300:
+                try: self.release(rid)
+                except Exception as e: print(f'reservation release failed: {e}',file=sys.stderr)
 
 def sync_keeper_metadata():
     if not requests or not KEEPER_PASSWORD: return None

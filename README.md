@@ -30,6 +30,7 @@ own SQLite database.
 - API keys and aliases synchronized from Keeper every five minutes
 - Model prices synchronized from Keeper every five minutes and cached locally
 - Actual token cost settled from CLIProxyAPI's authenticated `usage` subscription
+- Immediate reservation release when CLIProxyAPI returns a non-success status or the connection fails before a response
 - Non-streaming and SSE streaming proxy support
 - SQLite WAL ledger with deduplication by API key and request ID
 - Loopback-only administration UI with HTTP Basic authentication
