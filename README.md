@@ -26,7 +26,7 @@ own SQLite database.
 - Independent billing cycle for every API key
 - Reset one user at any time; the next cycle starts at the reset timestamp
 - Reset all active Keeper users with one confirmed action
-- Configurable cycle length in calendar months, quota, RPM, concurrency, and enable state
+- Calendar-month or fixed-day cycles, with configurable quota, RPM, concurrency, and enable state
 - API keys and aliases synchronized from Keeper every five minutes
 - Model prices synchronized from Keeper every five minutes and cached locally
 - Actual token cost settled from CLIProxyAPI's authenticated `usage` subscription
@@ -35,15 +35,17 @@ own SQLite database.
 - SQLite WAL ledger with deduplication by API key and request ID
 - Loopback-only administration UI with HTTP Basic authentication
 - Raw API keys are used in memory for hashing but are never stored in the quota database
+- Bearer-authenticated endpoints expose the caller's cycle quota and the cached Codex weekly limit
 
 ## Period Semantics
 
 Each user has a separate `period_started_at` and `period_ends_at`.
 
-- A user initialized on a normal calendar cycle starts on the first day of the current month.
+- The default calendar cycle starts on the first day of the current month and resets on the first day of the next month.
 - Resetting a user at `2026-08-17 10:30` starts a new cycle at that exact time.
-- With a one-month cycle, that user's next boundary is `2026-09-17 10:30`.
-- Calendar arithmetic is used, so a reset on the last day of a month is capped to the last valid day of the target month.
+- On a calendar cycle, that user's next boundary is `2026-09-01 00:00`.
+- Fixed cycles run from their start timestamp for 7 days, 30 days, or any custom 1-3650 day duration.
+- Changing the cycle rule immediately starts a new period.
 - Resetting starts a zero-usage period but does not delete historical ledger entries.
 - Requests already in flight at reset time remain attached to their original period.
 
@@ -113,7 +115,7 @@ The provided unit uses a systemd dynamic user and writes only to
 | `CPA_MANAGEMENT_KEY` | required | CLIProxyAPI usage subscription authentication |
 | `QUOTA_DB` | `data/quota.db` | Durable quota SQLite path |
 | `BILLING_TIMEZONE` | `Asia/Shanghai` | Period boundary display and calendar arithmetic |
-| `DEFAULT_MONTHLY_BUDGET_USD` | `1000` | Initial quota for newly synchronized users |
+| `DEFAULT_BUDGET_USD` | `1000` | Initial cycle quota for newly synchronized users |
 | `DEFAULT_RPM` | `120` | Initial per-key request limit per minute; `0` disables it |
 | `DEFAULT_CONCURRENCY` | `20` | Initial concurrent in-flight limit; `0` disables it |
 | `RESERVATION_USD` | `2` | Minimum request pre-authorization |
@@ -132,11 +134,18 @@ The gateway signs in to Keeper locally and reads:
 ```text
 GET /api/v1/usage/api-keys/settings
 GET /api/v1/pricing
+GET /api/v1/quota/inspection
+POST /api/v1/quota/cache
 ```
 
 The first endpoint supplies API keys and aliases. The second supplies the same
 model price settings Keeper uses for cost estimates, including prompt,
 completion, cache-read, cache-write, and the model multiplier.
+
+The quota endpoints provide Keeper's cached Codex upstream limits. After a
+successful synchronization, API keys removed from Keeper are deleted from the
+gateway together with their policies, periods, reservations, and ledger rows.
+A failed synchronization is rolled back and retains the last successful cache.
 
 The gateway immediately hashes each API key with SHA-256. Only the hash, a
 masked hint, and the alias are persisted. A failed Keeper sync retains the last
@@ -194,8 +203,34 @@ Then open `http://127.0.0.1:8320/admin/` and sign in with:
 - Username: `admin`
 - Password: the configured `QUOTA_ADMIN_TOKEN`
 
-The UI can edit each user's quota, cycle length, RPM, concurrency, and enable
-state. Aliases are read-only because Keeper is their source of truth.
+The UI can edit each user's quota, cycle rule, RPM, concurrency, and enable
+state. A cycle can be a calendar month, 7 days, 30 days, or a custom 1-3650
+days. Aliases are read-only because Keeper is their source of truth.
+
+## User Query Endpoints
+
+Both endpoints authenticate with the caller's own Bearer API key:
+
+```bash
+curl -H "Authorization: Bearer $API_KEY" https://SERVER/v1/limit
+curl -H "Authorization: Bearer $API_KEY" https://SERVER/v1/usage
+```
+
+`GET /v1/limit` returns only the caller's quota, usage, reset time, and cycle:
+
+```json
+{"limit_usd":1000.0,"used_usd":12.5,"reset_at":"2026-09-01T00:00:00+08:00","cycle":{"type":"calendar_month","days":null}}
+```
+
+`GET /v1/usage` returns the Codex primary weekly window from Keeper's cache:
+
+```json
+{"used_percent":63.0,"reset_at":"2026-08-20T16:07:18+08:00"}
+```
+
+The current deployment has one Codex upstream account. With multiple accounts,
+the endpoint returns the first cached seven-day primary window; it does not
+aggregate accounts.
 
 ### Reset Behavior
 
@@ -245,6 +280,8 @@ Check metadata and proxy health:
 python3 gateway.py --check
 curl -u "admin:$QUOTA_ADMIN_TOKEN" http://127.0.0.1:8320/admin/health
 curl -H "Authorization: Bearer $API_KEY" http://127.0.0.1:8320/v1/models
+curl -H "Authorization: Bearer $API_KEY" http://127.0.0.1:8320/v1/limit
+curl -H "Authorization: Bearer $API_KEY" http://127.0.0.1:8320/v1/usage
 ```
 
 ## Upgrade and Rollback

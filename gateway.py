@@ -6,7 +6,7 @@ It snapshots the Keeper pricing API into its own SQLite database and keeps all
 policy and accounting data there, so upgrading Keeper does not replace quotas.
 """
 import argparse, base64, calendar, hashlib, http.client, json, os, re, secrets, socket, sqlite3, sys, threading, time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS policies(
  key_hash TEXT PRIMARY KEY, key_hint TEXT NOT NULL, alias TEXT NOT NULL DEFAULT '',
  monthly_limit_micro INTEGER NOT NULL, rpm INTEGER NOT NULL, concurrency INTEGER NOT NULL,
  enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
- cycle_months INTEGER NOT NULL DEFAULT 1, period_id TEXT NOT NULL DEFAULT '',
+ cycle_months INTEGER NOT NULL DEFAULT 1, cycle_type TEXT NOT NULL DEFAULT 'calendar_month',
+ cycle_days INTEGER NOT NULL DEFAULT 30, period_id TEXT NOT NULL DEFAULT '',
  period_started_at INTEGER NOT NULL DEFAULT 0, period_ends_at INTEGER NOT NULL DEFAULT 0,
  keeper_active INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE IF NOT EXISTS periods(
@@ -65,7 +66,7 @@ KEEPER_URL = env("KEEPER_URL", "http://127.0.0.1:8318")
 KEEPER_DB = env("KEEPER_DB", str(BASE_DIR.parent / "cpa-usage-keeper" / "data" / "app.db"))
 KEEPER_PASSWORD = env("KEEPER_LOGIN_PASSWORD", env("LOGIN_PASSWORD"))
 CPA_MANAGEMENT_KEY = env("CPA_MANAGEMENT_KEY")
-DEFAULT_LIMIT = int(round(float(env("DEFAULT_MONTHLY_BUDGET_USD", "1000")) * MICRO))
+DEFAULT_LIMIT = int(round(float(env("DEFAULT_BUDGET_USD", env("DEFAULT_MONTHLY_BUDGET_USD", "1000"))) * MICRO))
 DEFAULT_RPM = int_env("DEFAULT_RPM", 120)
 DEFAULT_CONCURRENCY = int_env("DEFAULT_CONCURRENCY", 20)
 RESERVATION = int(round(float(env("RESERVATION_USD", "2")) * MICRO))
@@ -91,6 +92,15 @@ def calendar_period_bounds(ts=None):
     d=datetime.fromtimestamp(ts or time.time(),BILLING_ZONE)
     start=int(datetime(d.year,d.month,1,tzinfo=BILLING_ZONE).timestamp())
     return start,add_months(start,1)
+def fixed_period_bounds(ts, days):
+    start=int(ts or time.time()); end=int((datetime.fromtimestamp(start,BILLING_ZONE)+timedelta(days=max(1,int(days)))).timestamp())
+    return start,end
+def cycle_bounds(ts, cycle_type='calendar_month', cycle_days=30):
+    return fixed_period_bounds(ts,cycle_days) if cycle_type=='fixed_days' else calendar_period_bounds(ts)
+def next_cycle_end(start, cycle_type, cycle_days):
+    return cycle_bounds(start,cycle_type,cycle_days)[1]
+def cycle_label(policy):
+    return '自然月' if policy['cycle_type']=='calendar_month' else f"{int(policy['cycle_days'])} 天"
 def key_hash(key): return hashlib.sha256(key.encode()).hexdigest()
 def key_hint(key): return (key[:4] + "..." + key[-4:]) if len(key) >= 10 else ("..." + key[-4:])
 def db():
@@ -104,6 +114,8 @@ def init_db():
     columns={row['name'] for row in c.execute('PRAGMA table_info(policies)')}
     migrations={
         'cycle_months':"ALTER TABLE policies ADD COLUMN cycle_months INTEGER NOT NULL DEFAULT 1",
+        'cycle_type':"ALTER TABLE policies ADD COLUMN cycle_type TEXT NOT NULL DEFAULT 'calendar_month'",
+        'cycle_days':"ALTER TABLE policies ADD COLUMN cycle_days INTEGER NOT NULL DEFAULT 30",
         'period_id':"ALTER TABLE policies ADD COLUMN period_id TEXT NOT NULL DEFAULT ''",
         'period_started_at':"ALTER TABLE policies ADD COLUMN period_started_at INTEGER NOT NULL DEFAULT 0",
         'period_ends_at':"ALTER TABLE policies ADD COLUMN period_ends_at INTEGER NOT NULL DEFAULT 0",
@@ -112,7 +124,10 @@ def init_db():
     for name,sql in migrations.items():
         if name not in columns: c.execute(sql)
     start,end=calendar_period_bounds(); current=period_key()
-    c.execute("UPDATE policies SET cycle_months=1 WHERE cycle_months<1")
+    c.execute("UPDATE policies SET cycle_type='fixed_days',cycle_days=30*cycle_months WHERE cycle_months>1 AND cycle_type='calendar_month'")
+    c.execute("UPDATE policies SET cycle_months=1")
+    c.execute("UPDATE policies SET cycle_type='calendar_month' WHERE cycle_type NOT IN ('calendar_month','fixed_days') OR cycle_type=''")
+    c.execute("UPDATE policies SET cycle_days=30 WHERE cycle_days<1")
     c.execute("UPDATE policies SET period_id=?,period_started_at=?,period_ends_at=? WHERE period_id='' OR period_started_at=0 OR period_ends_at=0",(current,start,end))
     c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('last_price_sync','0')")
     c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('last_key_sync','0')")
@@ -130,16 +145,16 @@ def cost_micro(c, model, it, ot, crt, cwt):
 
 def ensure_policy(c, kh, key):
     t = now(); hint = key_hint(key); start,end=calendar_period_bounds(t); current=period_key(t)
-    c.execute("INSERT OR IGNORE INTO policies(key_hash,key_hint,monthly_limit_micro,rpm,concurrency,created_at,updated_at,cycle_months,period_id,period_started_at,period_ends_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (kh,hint,DEFAULT_LIMIT,DEFAULT_RPM,DEFAULT_CONCURRENCY,t,t,1,current,start,end))
+    c.execute("INSERT OR IGNORE INTO policies(key_hash,key_hint,monthly_limit_micro,rpm,concurrency,created_at,updated_at,cycle_months,cycle_type,cycle_days,period_id,period_started_at,period_ends_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (kh,hint,DEFAULT_LIMIT,DEFAULT_RPM,DEFAULT_CONCURRENCY,t,t,1,'calendar_month',30,current,start,end))
     return refresh_policy_period(c,c.execute("SELECT * FROM policies WHERE key_hash=?", (kh,)).fetchone(),t)
 
 def refresh_policy_period(c, policy, ts=None):
-    t=ts or now(); start=int(policy['period_started_at']); end=int(policy['period_ends_at']); months=max(1,int(policy['cycle_months']))
+    t=ts or now(); start=int(policy['period_started_at']); end=int(policy['period_ends_at']); cycle_type=policy['cycle_type']; days=max(1,int(policy['cycle_days']))
     if start<=0 or end<=start:
-        start,end=calendar_period_bounds(t); pid=period_key(t)
+        start,end=cycle_bounds(t,cycle_type,days); pid=period_key(t) if cycle_type=='calendar_month' else f'cycle:{start}'
     elif t>=end:
-        start=end; end=add_months(start,months)
-        while t>=end: start=end; end=add_months(start,months)
+        start=end; end=next_cycle_end(start,cycle_type,days)
+        while t>=end: start=end; end=next_cycle_end(start,cycle_type,days)
         pid=f'cycle:{start}'
     else: return policy
     c.execute('UPDATE policies SET period_id=?,period_started_at=?,period_ends_at=?,updated_at=? WHERE key_hash=?',(pid,start,end,t,policy['key_hash']))
@@ -150,10 +165,18 @@ def reset_policy_periods(c, key_hashes, ts=None):
     for kh in key_hashes:
         p=c.execute('SELECT * FROM policies WHERE key_hash=?',(kh,)).fetchone()
         if not p: continue
-        end=add_months(t,max(1,int(p['cycle_months']))); pid=f'reset:{t}:{secrets.token_hex(4)}'
+        end=next_cycle_end(t,p['cycle_type'],p['cycle_days']); pid=f'reset:{t}:{secrets.token_hex(4)}'
         c.execute('UPDATE policies SET period_id=?,period_started_at=?,period_ends_at=?,updated_at=? WHERE key_hash=?',(pid,t,end,t,kh))
         c.execute('INSERT OR IGNORE INTO periods(key_hash,period) VALUES(?,?)',(kh,pid)); reset.append(kh)
     return reset
+
+def delete_policies(c, key_hashes):
+    removed=0
+    for kh in key_hashes:
+        for table in ('reservations','ledger','request_ticks','periods'):
+            c.execute(f'DELETE FROM {table} WHERE key_hash=?',(kh,))
+        removed+=c.execute('DELETE FROM policies WHERE key_hash=?',(kh,)).rowcount
+    return removed
 
 def event_id(kh, request_id, fallback):
     stable=request_id.strip() if request_id else fallback
@@ -181,8 +204,33 @@ def policy_summaries(c):
         p=refresh_policy_period(c,row)
         usage=c.execute('SELECT spent_micro,reserved_micro FROM periods WHERE key_hash=? AND period=?',(p['key_hash'],p['period_id'])).fetchone()
         spent=int(usage['spent_micro']) if usage else 0; reserved=int(usage['reserved_micro']) if usage else 0
-        items.append({'key_hash':p['key_hash'],'key_hint':p['key_hint'],'alias':p['alias'],'limit_usd':p['monthly_limit_micro']/MICRO,'spent_usd':spent/MICRO,'reserved_usd':reserved/MICRO,'used_usd':(spent+reserved)/MICRO,'remaining_usd':max(0,p['monthly_limit_micro']-spent-reserved)/MICRO,'rpm':p['rpm'],'concurrency':p['concurrency'],'enabled':bool(p['enabled']),'cycle_months':p['cycle_months'],'period_id':p['period_id'],'period_started_at':iso_time(p['period_started_at']),'period_ends_at':iso_time(p['period_ends_at']),'keeper_active':bool(p['keeper_active'])})
+        items.append({'key_hash':p['key_hash'],'key_hint':p['key_hint'],'alias':p['alias'],'limit_usd':p['monthly_limit_micro']/MICRO,'spent_usd':spent/MICRO,'reserved_usd':reserved/MICRO,'used_usd':(spent+reserved)/MICRO,'remaining_usd':max(0,p['monthly_limit_micro']-spent-reserved)/MICRO,'rpm':p['rpm'],'concurrency':p['concurrency'],'enabled':bool(p['enabled']),'cycle_type':p['cycle_type'],'cycle_days':p['cycle_days'],'cycle_label':cycle_label(p),'period_id':p['period_id'],'period_started_at':iso_time(p['period_started_at']),'period_ends_at':iso_time(p['period_ends_at']),'keeper_active':bool(p['keeper_active'])})
     return items
+
+def user_limit(c, key):
+    kh=key_hash(key); c.execute('BEGIN IMMEDIATE'); p=c.execute('SELECT * FROM policies WHERE key_hash=?',(kh,)).fetchone()
+    if not p or not p['keeper_active']:
+        c.rollback(); return None
+    p=refresh_policy_period(c,p); expire_reservations(c,now())
+    usage=c.execute('SELECT spent_micro,reserved_micro FROM periods WHERE key_hash=? AND period=?',(kh,p['period_id'])).fetchone()
+    spent=int(usage['spent_micro']) if usage else 0; reserved=int(usage['reserved_micro']) if usage else 0
+    result={'limit_usd':p['monthly_limit_micro']/MICRO,'used_usd':(spent+reserved)/MICRO,'reset_at':iso_time(p['period_ends_at']),'cycle':{'type':p['cycle_type'],'days':p['cycle_days'] if p['cycle_type']=='fixed_days' else None}}
+    c.commit(); return result
+
+def fetch_codex_weekly_usage():
+    if not requests or not KEEPER_PASSWORD: raise RuntimeError('Keeper is not configured')
+    s=requests.Session(); h={'X-CPA-Usage-Keeper-Request':'fetch'}
+    r=s.post(KEEPER_URL+'/api/v1/auth/login',json={'password':KEEPER_PASSWORD},headers=h,timeout=10); r.raise_for_status()
+    r=s.get(KEEPER_URL+'/api/v1/quota/inspection',headers=h,timeout=10); r.raise_for_status()
+    indexes=[str(x.get('auth_index') or '') for x in r.json().get('results',[]) if x.get('type')=='codex' and x.get('auth_index')]
+    if not indexes: raise RuntimeError('no Codex quota is cached in Keeper')
+    r=s.post(KEEPER_URL+'/api/v1/quota/cache',json={'auth_indexes':indexes},headers=h,timeout=10); r.raise_for_status()
+    for item in r.json().get('items',[]):
+        for quota in ((item.get('quota') or {}).get('quota') or []):
+            window=quota.get('window') or {}
+            if quota.get('key')=='rate_limit.primary_window' and int(window.get('seconds') or 0)==7*24*60*60:
+                return {'used_percent':float(quota.get('usedPercent') or 0),'reset_at':str(quota.get('resetAt') or '')}
+    raise RuntimeError('weekly Codex quota is unavailable in Keeper')
 
 class UsageSubscriber(threading.Thread):
     daemon = True
@@ -226,7 +274,10 @@ class UsageSubscriber(threading.Thread):
         eid=event_id(kh,rid,stamp+'|'+model+'|'+str(it)+'|'+str(ot))
         c=db(); t=now(); c.execute('BEGIN IMMEDIATE')
         try:
-            p=ensure_policy(c,kh,key)
+            p=c.execute('SELECT * FROM policies WHERE key_hash=? AND keeper_active=1',(kh,)).fetchone()
+            if not p:
+                c.rollback(); return
+            p=refresh_policy_period(c,p,t)
             r=c.execute("SELECT id,amount_micro,period FROM reservations WHERE key_hash=? AND state='active' ORDER BY created_at LIMIT 1",(kh,)).fetchone()
             per=r['period'] if r else p['period_id']
             c.execute("INSERT OR IGNORE INTO periods(key_hash,period) VALUES(?,?)",(kh,per))
@@ -253,7 +304,9 @@ class Gateway(BaseHTTPRequestHandler):
     def acquire(self, key, model, amount):
         kh=key_hash(key); c=db(); t=now(); rid=secrets.token_hex(16); c.execute('BEGIN IMMEDIATE')
         try:
-            p=ensure_policy(c,kh,key)
+            p=c.execute('SELECT * FROM policies WHERE key_hash=? AND keeper_active=1',(kh,)).fetchone()
+            if not p: raise KeyError('invalid API key')
+            p=refresh_policy_period(c,p,t)
             per=p['period_id']
             expire_reservations(c,t)
             c.execute("DELETE FROM request_ticks WHERE created_at<?",(t-120,))
@@ -302,7 +355,7 @@ class Gateway(BaseHTTPRequestHandler):
             if result is None: json_response(self,502,{'error':'Keeper metadata sync failed'}); return True
             json_response(self,200,result); return True
         if path=='/admin/policies' and self.command=='GET':
-            rows=[dict(x) for x in c.execute('SELECT key_hash,key_hint,alias,monthly_limit_micro/1000000.0 monthly_limit_usd,rpm,concurrency,enabled,updated_at FROM policies ORDER BY key_hint')]; json_response(self,200,{'policies':rows}); c.close(); return True
+            rows=[dict(x) for x in c.execute('SELECT key_hash,key_hint,alias,monthly_limit_micro/1000000.0 limit_usd,rpm,concurrency,enabled,updated_at FROM policies ORDER BY key_hint')]; json_response(self,200,{'policies':rows}); c.close(); return True
         if path=='/admin/summary' and self.command=='GET':
             c.execute('BEGIN IMMEDIATE'); rows=policy_summaries(c); c.commit()
             sync={r['key']:int(r['value']) for r in c.execute("SELECT key,value FROM settings WHERE key IN ('last_price_sync','last_key_sync')")}
@@ -313,15 +366,18 @@ class Gateway(BaseHTTPRequestHandler):
             n=int(self.headers.get('Content-Length','0')); body=json.loads(self.rfile.read(min(n,16384))); key=str(body.get('api_key') or '')
             kh=str(body.get('key_hash') or (key_hash(key) if key else '')); c.execute('BEGIN IMMEDIATE'); row=c.execute('SELECT * FROM policies WHERE key_hash=?',(kh,)).fetchone()
             if not row: c.rollback(); c.close(); json_response(self,404,{'error':'policy not found; send api_key once to create'}); return True
-            if ('monthly_limit_usd' in body and float(body['monthly_limit_usd'])<0) or ('rpm' in body and int(body['rpm'])<0) or ('concurrency' in body and int(body['concurrency'])<0) or ('cycle_months' in body and not 1<=int(body['cycle_months'])<=120):
+            limit_value=body.get('limit_usd',body.get('monthly_limit_usd')); cycle_type=str(body.get('cycle_type') or row['cycle_type']); cycle_days=int(body.get('cycle_days') or row['cycle_days'])
+            if (limit_value is not None and float(limit_value)<0) or ('rpm' in body and int(body['rpm'])<0) or ('concurrency' in body and int(body['concurrency'])<0) or cycle_type not in ('calendar_month','fixed_days') or not 1<=cycle_days<=3650:
                 c.rollback(); c.close(); json_response(self,400,{'error':'invalid policy values'}); return True
             cols=[]; vals=[]
-            for name, val in [('monthly_limit_micro', (float(body['monthly_limit_usd'])*MICRO if 'monthly_limit_usd' in body else None)),('rpm',body.get('rpm')),('concurrency',body.get('concurrency')),('enabled',body.get('enabled')),('cycle_months',body.get('cycle_months'))]:
+            for name, val in [('monthly_limit_micro', (float(limit_value)*MICRO if limit_value is not None else None)),('rpm',body.get('rpm')),('concurrency',body.get('concurrency')),('enabled',body.get('enabled'))]:
                 if val is not None: cols.append(name+'=?'); vals.append(int(val))
+            cycle_changed=cycle_type!=row['cycle_type'] or (cycle_type=='fixed_days' and cycle_days!=row['cycle_days'])
+            if 'cycle_type' in body or 'cycle_days' in body:
+                cols.extend(('cycle_type=?','cycle_days=?')); vals.extend((cycle_type,cycle_days if cycle_type=='fixed_days' else 30))
             if cols:
                 vals += [now(),kh]; c.execute('UPDATE policies SET '+','.join(cols)+',updated_at=? WHERE key_hash=?',vals)
-                if 'cycle_months' in body:
-                    p=c.execute('SELECT * FROM policies WHERE key_hash=?',(kh,)).fetchone(); end=add_months(p['period_started_at'],max(1,int(p['cycle_months']))); c.execute('UPDATE policies SET period_ends_at=? WHERE key_hash=?',(end,kh))
+                if cycle_changed: reset_policy_periods(c,[kh])
                 c.commit(); out=next(x for x in policy_summaries(c) if x['key_hash']==kh); json_response(self,200,out)
             else: c.rollback(); json_response(self,400,{'error':'no policy fields'})
             c.close(); return True
@@ -335,11 +391,25 @@ class Gateway(BaseHTTPRequestHandler):
         c.close(); json_response(self,404,{'error':'not found'}); return True
     def dispatch(self):
         if self.path.startswith('/admin/'): self.do_admin(); return
+        if self.path.split('?',1)[0] in ('/v1/limit','/v1/usage'): self.do_user_query(); return
         self.proxy()
     def do_GET(self): self.dispatch()
     def do_POST(self): self.dispatch()
     def do_PUT(self): self.dispatch()
     def do_DELETE(self): self.dispatch()
+    def do_user_query(self):
+        if self.command!='GET': json_response(self,405,{'error':'method not allowed'},{'Allow':'GET'}); return
+        key=self.auth_key()
+        if not key: json_response(self,401,{'error':'missing bearer API key'}); return
+        c=db()
+        try: limit=user_limit(c,key)
+        finally: c.close()
+        if limit is None: json_response(self,401,{'error':'invalid API key'}); return
+        if self.path.split('?',1)[0]=='/v1/limit': json_response(self,200,limit); return
+        try: json_response(self,200,fetch_codex_weekly_usage())
+        except Exception as e:
+            print(f'Keeper Codex quota query failed: {e}',file=sys.stderr)
+            json_response(self,502,{'error':'Codex weekly usage is unavailable'} )
     def proxy(self):
         if not self.path.startswith('/v1/'):
             json_response(self,404,{'error':'not found'}); return
@@ -371,7 +441,8 @@ class Gateway(BaseHTTPRequestHandler):
                 amount=max(RESERVATION,output_hold+input_hold+RESERVATION//4)
             except (ValueError, TypeError, json.JSONDecodeError): amount=RESERVATION
         try: rid,_=self.acquire(key,model,amount)
-        except PermissionError: json_response(self,429,{'error':{'message':'monthly quota exceeded','type':'quota_exceeded','code':'quota_exceeded'}}, {'Retry-After':'3600'}); return
+        except KeyError: json_response(self,401,{'error':{'message':'invalid API key','type':'authentication_error','code':'invalid_api_key'}}); return
+        except PermissionError: json_response(self,429,{'error':{'message':'cycle quota exceeded','type':'quota_exceeded','code':'quota_exceeded'}}, {'Retry-After':'3600'}); return
         except TimeoutError as e: json_response(self,429,{'error':{'message':str(e),'type':'rate_limit_error','code':str(e)}},{'Retry-After':'1'}); return
         except ValueError: json_response(self,403,{'error':{'message':'API key disabled','type':'permission_error'}}); return
         except Exception as e: print(f'acquire failed: {e}',file=sys.stderr); json_response(self,503,{'error':{'message':'quota ledger unavailable','type':'server_error'}}); return
@@ -418,10 +489,11 @@ def sync_keeper_metadata():
             if not key: continue
             kh=key_hash(key); ensure_policy(c,kh,key)
             c.execute('UPDATE policies SET key_hint=?,alias=?,keeper_active=1,updated_at=? WHERE key_hash=?',(key_hint(key),str(item.get('keyAlias') or '').strip(),t,kh)); synced+=1
+        removed=delete_policies(c,[r['key_hash'] for r in c.execute('SELECT key_hash FROM policies WHERE keeper_active=0').fetchall()])
         c.execute("UPDATE settings SET value=? WHERE key='last_price_sync'",(str(t),)); c.execute("UPDATE settings SET value=? WHERE key='last_key_sync'",(str(t),)); c.commit(); c.close()
         c=None
-        print(f'keeper sync: {len(prices)} prices, {synced} API keys')
-        return {'price_count':len(prices),'key_count':synced,'synced_at':iso_time(t)}
+        print(f'keeper sync: {len(prices)} prices, {synced} API keys, {removed} removed')
+        return {'price_count':len(prices),'key_count':synced,'removed_count':removed,'synced_at':iso_time(t)}
     except Exception as e:
         if c is not None:
             try: c.rollback(); c.close()
@@ -467,7 +539,7 @@ class QuotaHTTPServer(ThreadingHTTPServer):
 def main():
     global DB_PATH
     ap=argparse.ArgumentParser(); ap.add_argument('--check',action='store_true'); ap.add_argument('--backfill-keeper-month',action='store_true'); ap.add_argument('--sync-keeper',action='store_true'); args=ap.parse_args(); init_db(); sync_keeper_metadata()
-    if args.check: print(json.dumps({'ok':True,'db':DB_PATH,'upstream':UPSTREAM,'period':period_key(),'default_monthly_usd':DEFAULT_LIMIT/MICRO})); return
+    if args.check: print(json.dumps({'ok':True,'db':DB_PATH,'upstream':UPSTREAM,'period':period_key(),'default_budget_usd':DEFAULT_LIMIT/MICRO})); return
     if args.backfill_keeper_month: backfill_keeper_month(); return
     if args.sync_keeper: return
     threading.Thread(target=metadata_loop,daemon=True).start(); UsageSubscriber().start()

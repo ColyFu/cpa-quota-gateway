@@ -20,7 +20,7 @@ CLIProxyAPI :8317      -> 实时 usage 事件订阅
 ## 功能
 
 - 每个 API Key 单独设置美元额度、RPM、并发数和启停状态
-- 每个用户拥有独立的开始时间、结束时间和周期月数
+- 每个用户拥有独立的开始时间、结束时间和周期规则
 - 单独重置用户额度，重置时刻就是新周期的开始时间
 - 二次确认后一键重置 Keeper 中所有有效用户
 - 每五分钟从 Keeper 同步 API Key、别名和模型价格
@@ -31,18 +31,19 @@ CLIProxyAPI :8317      -> 实时 usage 事件订阅
 - SQLite WAL 流水，按 API Key 和请求 ID 防止重复计费
 - 独立管理页面，不修改 Keeper 前端
 - 配额数据库不保存明文 API Key，只保存 SHA-256、掩码和别名
+- 用户可用自己的 API Key 查询本周期额度及 Codex 上游周限额
 
 ## 独立周期和重置规则
 
 每个用户分别保存 `period_started_at` 和 `period_ends_at`。
 
-- 正常初始化的用户从当月第一天开始计算。
+- 默认使用自然月，新用户从当月第一天开始计算，下月第一天重置。
 - 用户在 `2026-08-17 10:30` 重置后，新周期从该时刻开始。
-- 周期为一个自然月时，结束时间是 `2026-09-17 10:30`。
-- 月末日期会自动适配目标月份的最后一天。
+- 周期为自然月时，结束时间是 `2026-09-01 00:00`。
+- 固定天数周期从开始时刻起计算，支持 7 天、30 天或自定义 1–3650 天。
+- 修改周期规则会立即从修改时刻开启一个新周期。
 - 重置不会删除历史周期和历史流水，只会新建一个用量为零的周期。
 - 重置时已经在处理的请求仍结算到旧周期，避免账目串期。
-- 周期月数可以为每个用户分别设置，例如 1、3 或 12 个自然月。
 
 ## 环境要求
 
@@ -108,7 +109,7 @@ sudo systemctl status cpa-quota-gateway.service
 | `CPA_MANAGEMENT_KEY` | 必填 | CLIProxyAPI 用量订阅认证密钥 |
 | `QUOTA_DB` | `data/quota.db` | 独立 SQLite 数据库路径 |
 | `BILLING_TIMEZONE` | `Asia/Shanghai` | 周期计算和页面显示时区 |
-| `DEFAULT_MONTHLY_BUDGET_USD` | `1000` | 新同步用户的默认额度 |
+| `DEFAULT_BUDGET_USD` | `1000` | 新同步用户的默认周期额度 |
 | `DEFAULT_RPM` | `120` | 新用户默认每分钟请求数，`0` 表示关闭 |
 | `DEFAULT_CONCURRENCY` | `20` | 新用户默认并发数，`0` 表示关闭 |
 | `RESERVATION_USD` | `2` | 单次请求最低预占金额 |
@@ -126,10 +127,17 @@ sudo systemctl status cpa-quota-gateway.service
 ```text
 GET /api/v1/usage/api-keys/settings
 GET /api/v1/pricing
+GET /api/v1/quota/inspection
+POST /api/v1/quota/cache
 ```
 
 第一项提供 API Key 和别名，第二项提供普通输入、输出、缓存读取、缓存写入
-以及价格倍率。API Key 在内存中立即计算 SHA-256，配额数据库不会保存明文。
+以及价格倍率。后两项提供 Keeper 已缓存的 Codex 上游限额。API Key 在内存中
+立即计算 SHA-256，配额数据库不会保存明文。
+
+Keeper 成功同步后，Keeper 已删除的 API Key 会从网关删除，其策略、周期、
+reservation 和计费流水也会一并清理。Keeper 同步失败时事务会回滚，继续使用
+最后一次成功同步的缓存，不会因暂时不可用而删除用户。
 
 服务启动时立即同步，之后每五分钟同步一次。管理页面的 `同步 Keeper` 按钮可
 立即同步。
@@ -174,14 +182,40 @@ ssh -L 8320:127.0.0.1:8320 user@your-server
 - 用户名：`admin`
 - 密码：配置文件中的 `QUOTA_ADMIN_TOKEN`
 
-页面可以设置每个用户的额度、周期月数、RPM、并发和启停状态。用户别名以
-Keeper 为唯一来源，因此在网关页面中只读。
+页面可以设置每个用户的额度、周期规则、RPM、并发和启停状态。周期可选自然月、
+固定 7 天、固定 30 天或自定义 1–3650 天。用户别名以 Keeper 为唯一来源，因此
+在网关页面中只读。
 
 `重置` 只为当前用户开启新周期；`重置全部额度` 为 Keeper 当前所有有效用户
 开启新周期。两个操作都保留历史数据。
 
 所有修改类管理 API 还必须携带 `X-Quota-Admin-Request: 1` 请求头，用于阻止
 浏览器跨站请求伪造；管理页面会自动添加该请求头。
+
+## 用户查询接口
+
+两个接口均使用调用者自己的 Bearer API Key，不需要管理令牌：
+
+```bash
+curl -H "Authorization: Bearer $API_KEY" https://SERVER/v1/limit
+curl -H "Authorization: Bearer $API_KEY" https://SERVER/v1/usage
+```
+
+`GET /v1/limit` 只返回当前 Key 的周期额度、已用金额、重置时间和周期规则：
+
+```json
+{"limit_usd":1000.0,"used_usd":12.5,"reset_at":"2026-09-01T00:00:00+08:00","cycle":{"type":"calendar_month","days":null}}
+```
+
+`GET /v1/usage` 从 Keeper 配额缓存读取 Codex 主周窗口，只返回周限额已用百分比
+和重置时间：
+
+```json
+{"used_percent":63.0,"reset_at":"2026-08-20T16:07:18+08:00"}
+```
+
+当前部署只有一个 Codex 上游账号；存在多个账号时，接口返回 Keeper 缓存中的
+第一个 7 天主窗口，不做跨账号汇总。
 
 ## 现有月份历史回填
 
@@ -201,6 +235,8 @@ python3 test_gateway.py
 python3 gateway.py --check
 curl -u "admin:$QUOTA_ADMIN_TOKEN" http://127.0.0.1:8320/admin/health
 curl -H "Authorization: Bearer $API_KEY" http://127.0.0.1:8320/v1/models
+curl -H "Authorization: Bearer $API_KEY" http://127.0.0.1:8320/v1/limit
+curl -H "Authorization: Bearer $API_KEY" http://127.0.0.1:8320/v1/usage
 ```
 
 ## 更新和回滚
