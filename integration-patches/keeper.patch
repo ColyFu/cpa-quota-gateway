@@ -1,35 +1,3 @@
-From 1c2ac07b853388d553c99da22d39db1b4882c4d2 Mon Sep 17 00:00:00 2001
-From: Codex <codex@local>
-Date: Fri, 23 Oct 2026 11:42:18 +0800
-Subject: [PATCH] Merge Gateway quotas, live queues and account settings into
- Keeper console
-
----
- internal/api/router.go                        |  12 +-
- internal/app/app.go                           |  37 ++-
- internal/app/test/gateway_integration_test.go |  32 ++
- web/index.html                                |   2 +-
- web/src/components/BrandLink.tsx              |   5 +-
- .../components/usage/ApiKeySettingsCard.tsx   |   9 +-
- web/src/features/gateway/AccountRouting.tsx   |  43 +++
- .../features/gateway/LocalRankingPanel.tsx    |  16 +
- web/src/features/gateway/QueuePools.test.tsx  |  41 +++
- web/src/features/gateway/QueuePools.tsx       |  45 +++
- .../features/gateway/UserQuotaSettings.tsx    |  70 +++++
- web/src/features/gateway/api.ts               |  11 +
- web/src/features/gateway/gateway.css          |   3 +
- web/src/i18n/index.ts                         |   6 +-
- web/src/pages/UsagePage.tsx                   | 296 ++----------------
- 15 files changed, 325 insertions(+), 303 deletions(-)
- create mode 100644 internal/app/test/gateway_integration_test.go
- create mode 100644 web/src/features/gateway/AccountRouting.tsx
- create mode 100644 web/src/features/gateway/LocalRankingPanel.tsx
- create mode 100644 web/src/features/gateway/QueuePools.test.tsx
- create mode 100644 web/src/features/gateway/QueuePools.tsx
- create mode 100644 web/src/features/gateway/UserQuotaSettings.tsx
- create mode 100644 web/src/features/gateway/api.ts
- create mode 100644 web/src/features/gateway/gateway.css
-
 diff --git a/internal/api/router.go b/internal/api/router.go
 index 45ae622..5b6b92b 100644
 --- a/internal/api/router.go
@@ -243,26 +211,87 @@ index 391f250..a1a9d55 100644
                  </div>
                );
              })}
+diff --git a/web/src/components/usage/credentials/useCredentialsTabData.ts b/web/src/components/usage/credentials/useCredentialsTabData.ts
+index be2e44d..cd0fd12 100644
+--- a/web/src/components/usage/credentials/useCredentialsTabData.ts
++++ b/web/src/components/usage/credentials/useCredentialsTabData.ts
+@@ -123,6 +123,7 @@ export function useCredentialsTabData({ enabledAuthFiles, enabledAiProviders, on
+     try {
+       const updated = await updateUsageIdentityAlias(id, alias)
+       credentialPages.replaceUsageIdentity(updated)
++      window.dispatchEvent(new Event('quota-account-alias-saved'))
+       onNotice?.('success', i18n.t('usage_stats.credentials_alias_save_success'))
+     } catch (error) {
+       if (error instanceof ApiError && error.status === 401) {
+diff --git a/web/src/features/gateway/AccountRouting.test.tsx b/web/src/features/gateway/AccountRouting.test.tsx
+new file mode 100644
+index 0000000..38f43df
+--- /dev/null
++++ b/web/src/features/gateway/AccountRouting.test.tsx
+@@ -0,0 +1,30 @@
++// @vitest-environment happy-dom
++import { act } from 'react';
++import { createRoot, type Root } from 'react-dom/client';
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
++import { AccountRouting } from './AccountRouting';
++import { gatewayAPI } from './api';
++vi.mock('./api',()=>({gatewayAPI:vi.fn()}));
++vi.mock('./useAccountAliases',()=>({useAccountAliases:()=>({accounts:[{id:'auth.json',name:'auth.json',provider:'codex',available:true}],byAccount:{'auth.json':{id:'identity-7',alias:'主账号'}},names:{'auth.json':'主账号'},error:'',reload:vi.fn()})}));
++globalThis.IS_REACT_ACT_ENVIRONMENT=true;
++describe('authentication aliases and account selection',()=>{
++ let root:Root;let container:HTMLDivElement;
++ beforeEach(()=>{vi.clearAllMocks();container=document.createElement('div');document.body.appendChild(container);root=createRoot(container);vi.mocked(gatewayAPI).mockImplementation(async(path,method,body)=>path==='concurrency'?{limit:4}:method==='PUT'?body:{enabled:false,session_ttl_hours:12,overflow_threshold:3,accounts:[],preferences:{}});});
++ afterEach(async()=>{await act(async()=>root.unmount());container.remove();});
++ it('shows unconfigured auth files and preserves their stable ID when enabling participation',async()=>{
++  await act(async()=>root.render(<AccountRouting onSaveAlias={vi.fn()} />));
++  expect(container.querySelectorAll('tbody tr')).toHaveLength(1);
++  expect((container.querySelector('[aria-label="认证账号别名"]') as HTMLInputElement).value).toBe('主账号');
++  await act(async()=>{(container.querySelector('[aria-label="主账号 参与调度"]') as HTMLInputElement).click();});
++  await act(async()=>{container.querySelectorAll('form')[1].dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));});
++  expect(vi.mocked(gatewayAPI).mock.calls.find(c=>c[0]==='routing'&&c[1]==='PUT')?.[2]).toMatchObject({enabled:false,accounts:[{id:'auth.json',name:'auth.json',enabled:true}]});
++ });
++ it('saves aliases separately from routing settings and surfaces a failed alias save',async()=>{
++  const save=vi.fn().mockRejectedValue(new Error('未保存'));await act(async()=>root.render(<AccountRouting onSaveAlias={save} />));
++  const input=container.querySelector('[aria-label="认证账号别名"]') as HTMLInputElement;
++  await act(async()=>{Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')!.set!.call(input,'工作账号');input.dispatchEvent(new Event('input',{bubbles:true}));});
++  await act(async()=>{(container.querySelector('.gw-account-alias button') as HTMLButtonElement).click();});
++  expect(save).toHaveBeenCalledWith('identity-7','工作账号');expect(vi.mocked(gatewayAPI).mock.calls.some(c=>c[1]==='PUT')).toBe(false);
++  expect(container.querySelector('[role=status]')?.textContent).toContain('别名保存失败');expect(input.value).toBe('工作账号');
++ });
++});
 diff --git a/web/src/features/gateway/AccountRouting.tsx b/web/src/features/gateway/AccountRouting.tsx
 new file mode 100644
-index 0000000..0f88168
+index 0000000..24cdb70
 --- /dev/null
 +++ b/web/src/features/gateway/AccountRouting.tsx
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,72 @@
 +import { useEffect, useState } from 'react';
-+import { gatewayAPI, type Routing } from './api';
++import type { UsageIdentity } from '@/lib/types';
++import { gatewayAPI, type Account, type Routing } from './api';
++import { useAccountAliases } from './useAccountAliases';
 +import './gateway.css';
-+interface Discovered { id: string; name: string; provider: string; available: boolean }
-+export function AccountRouting() {
++
++function AccountAlias({ identity, onSave, onNotice }: { identity?: UsageIdentity; onSave: (id: string, alias: string) => Promise<void>; onNotice: (message: string) => void }) {
++  const [alias, setAlias] = useState(identity?.alias ?? '');
++  const [busy, setBusy] = useState(false);
++  const save = async () => {
++    if (!identity) return;
++    setBusy(true);
++    try { await onSave(identity.id, alias.trim()); onNotice('认证账号别名已保存，优先认证账号列表同步使用此别名'); }
++    catch (e) { onNotice(`别名保存失败：${(e as Error).message}`); } finally { setBusy(false); }
++  };
++  return <div className="gw-account-alias"><input aria-label="认证账号别名" placeholder={identity ? '填写便于区分的别名' : '等待认证文件同步'} maxLength={50} disabled={!identity || busy} value={alias} onChange={e => setAlias(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); void save(); } }} /><button type="button" disabled={!identity || busy || alias.trim() === (identity.alias ?? '').trim()} onClick={() => void save()}>{busy ? '保存中…' : '保存别名'}</button></div>;
++}
++
++export function AccountRouting({ onSaveAlias }: { onSaveAlias: (id: string, alias: string) => Promise<void> }) {
 +  const [config, setConfig] = useState<Routing | null>(null);
 +  const [limit, setLimit] = useState(0);
-+  const [discovered, setDiscovered] = useState<Discovered[]>([]);
++  const aliases = useAccountAliases();
 +  const [message, setMessage] = useState('');
 +  const [busy, setBusy] = useState(false);
 +  useEffect(() => {
 +    const controller = new AbortController();
 +    void Promise.all([gatewayAPI<Routing>('routing', 'GET', undefined, controller.signal), gatewayAPI<{ limit: number }>('concurrency', 'GET', undefined, controller.signal)]).then(([routing, state]) => { setConfig(routing); setLimit(state.limit); }).catch(e => { if (!controller.signal.aborted) setMessage(e.message); });
-+    void gatewayAPI<{ accounts: Discovered[] }>('accounts', 'GET', undefined, controller.signal).then(d => setDiscovered(d.accounts)).catch(e => { if (!controller.signal.aborted) setMessage(e.message); });
 +    return () => controller.abort();
 +  }, []);
 +  const save = async (event: React.FormEvent) => {
@@ -270,8 +299,18 @@ index 0000000..0f88168
 +    try { const saved = await gatewayAPI<Routing>('routing', 'PUT', config); setConfig(saved); setMessage('账号调度设置已保存'); }
 +    catch (e) { setMessage(e instanceof Error ? e.message : '保存失败'); } finally { setBusy(false); }
 +  };
-+  return <section className="gw-card"><div className="gw-heading"><div><h2>并发与账号调度</h2><p>总并发控制整个网关；账号并发控制单个认证文件。</p></div></div>
++  const accounts = [...aliases.accounts, ...(config?.accounts.filter(account => !aliases.accounts.some(file => file.id === account.id)).map(account => ({ ...account, provider: '', available: false })) ?? [])];
++  const changeAccount = (id: string, update: Partial<Account>) => {
++    if (!config) return;
++    const previous = config.accounts.find(account => account.id === id);
++    const source = accounts.find(account => account.id === id);
++    if (!source) return;
++    const next = { id, name: source.name, enabled: false, concurrency: 1, models: [], ...previous, ...update };
++    setConfig({ ...config, accounts: previous ? config.accounts.map(account => account.id === id ? next : account) : [...config.accounts, next] });
++  };
++  return <section className="gw-card"><div className="gw-heading"><div><h2>并发与账号调度</h2><p>为认证文件设置别名后，用户的优先认证账号列表也会显示该别名。</p></div></div>
 +    {message && <p role="status" className="gw-message">{message}</p>}
++    {aliases.error && <p role="alert">认证账号读取失败：{aliases.error} <button onClick={aliases.reload}>重试</button></p>}
 +    <form className="gw-inline" onSubmit={async e => { e.preventDefault(); setBusy(true); try { await gatewayAPI('concurrency', 'PUT', { global_limit: limit }); setMessage('总并发已保存'); } catch(e) { setMessage((e as Error).message); } finally { setBusy(false); } }}>
 +      <label>总并发上限<input type="number" min="0" step="1" required value={limit} onChange={e => setLimit(Number(e.target.value))} /></label><button disabled={busy || !config}>保存总并发</button><span>0 表示不限制</span>
 +    </form>
@@ -282,13 +321,19 @@ index 0000000..0f88168
 +        <label>账号溢出阈值（排队数）<input type="number" min="0" step="1" required value={config.overflow_threshold} onChange={e => setConfig({ ...config, overflow_threshold: Number(e.target.value) })} /></label>
 +      </div>
 +      <p className="gw-help">同一用户的同一 session 从最近一次请求起保持绑定。新会话优先使用用户指定账号；账号满载且排队达到阈值时，才分配到有空位的账号。已有会话保持原账号，账号不可用时重新选择。</p>
-+      <div className="gw-table-wrap"><table className="gw-table"><thead><tr><th>认证文件</th><th>参与调度</th><th>账号并发</th><th>模型限制（留空由 CPA 判断）</th></tr></thead><tbody>{config.accounts.map((account, index) => <tr key={account.id}>
-+        <td><strong>{account.name}</strong><small>{account.id}</small></td>
-+        <td><input aria-label={`${account.name} 参与调度`} type="checkbox" checked={account.enabled} onChange={e => setConfig({ ...config, accounts: config.accounts.map((a, i) => i === index ? { ...a, enabled: e.target.checked } : a) })} /></td>
-+        <td><input aria-label={`${account.name} 账号并发`} type="number" min="1" step="1" required value={account.concurrency} onChange={e => setConfig({ ...config, accounts: config.accounts.map((a, i) => i === index ? { ...a, concurrency: Number(e.target.value) } : a) })} /></td>
-+        <td><input aria-label={`${account.name} 模型限制`} defaultValue={account.models.join(', ')} onBlur={e => setConfig({ ...config, accounts: config.accounts.map((a, i) => i === index ? { ...a, models: e.target.value.split(',').map(x => x.trim()).filter(Boolean) } : a) })} /></td>
-+      </tr>)}</tbody></table></div>
-+      <div className="gw-inline"><label>添加认证文件<select value="" onChange={e => { const a = discovered.find(x => x.id === e.target.value); if (a) setConfig({ ...config, accounts: [...config.accounts, { id: a.id, name: a.name, enabled: a.available, concurrency: 1, models: [] }] }); }}><option value="">请选择账号</option>{discovered.filter(a => !config.accounts.some(c => c.id === a.id)).map(a => <option key={a.id} value={a.id}>{a.name} · {a.provider}{a.available ? '' : '（不可用）'}</option>)}</select></label><button disabled={busy}>保存账号调度</button></div>
++      <div className="gw-table-wrap"><table className="gw-table gw-accounts-table"><thead><tr><th scope="col">认证文件</th><th scope="col">别名</th><th scope="col">参与调度</th><th scope="col">账号并发</th><th scope="col">模型限制（留空由 CPA 判断）</th></tr></thead><tbody>{accounts.map(file => {
++        const account = config.accounts.find(a => a.id === file.id);
++        const identity = aliases.byAccount[file.id];
++        const name = aliases.names[file.id] || file.name;
++        return <tr key={file.id}>
++          <td><strong>{name}</strong><small>{file.name}</small>{!file.available && <small>当前不可用</small>}</td>
++          <td><AccountAlias key={`${identity?.id}-${identity?.alias ?? ''}`} identity={identity} onSave={onSaveAlias} onNotice={setMessage} /></td>
++          <td><input aria-label={`${name} 参与调度`} type="checkbox" checked={account?.enabled ?? false} disabled={busy} onChange={e => changeAccount(file.id, { enabled: e.target.checked })} /></td>
++          <td><input aria-label={`${name} 账号并发`} type="number" min="1" step="1" required value={account?.concurrency ?? 1} disabled={busy || !account} onChange={e => changeAccount(file.id, { concurrency: Number(e.target.value) })} /></td>
++          <td><input aria-label={`${name} 模型限制`} disabled={busy || !account} defaultValue={account?.models.join(', ') ?? ''} onBlur={e => changeAccount(file.id, { models: e.target.value.split(',').map(x => x.trim()).filter(Boolean) })} /></td>
++        </tr>;
++      })}{accounts.length === 0 && <tr><td colSpan={5} className="gw-empty">{aliases.error ? '请重试加载认证文件' : '暂无已同步的认证文件'}</td></tr>}</tbody></table></div>
++      <div className="gw-inline"><button disabled={busy}>保存账号调度</button><button type="button" disabled={busy} onClick={aliases.reload}>刷新认证文件</button><span className="gw-help">别名单独保存；参与调度和并发修改后请保存账号调度。</span></div>
 +    </form>}
 +  </section>;
 +}
@@ -412,57 +457,174 @@ index 0000000..fc341a7
 +    <div className="gw-legend">{users.map(([id, name]) => <span key={id}><i style={{ background: `hsl(${userHue(id)} 65% 48%)` }} />{name}</span>)}</div>
 +  </section>;
 +}
+diff --git a/web/src/features/gateway/UserQuotaSettings.test.tsx b/web/src/features/gateway/UserQuotaSettings.test.tsx
+new file mode 100644
+index 0000000..a5da7aa
+--- /dev/null
++++ b/web/src/features/gateway/UserQuotaSettings.test.tsx
+@@ -0,0 +1,67 @@
++// @vitest-environment happy-dom
++import { act } from 'react';
++import { createRoot, type Root } from 'react-dom/client';
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
++import type { CpaApiKeySettingsItem } from '@/lib/types';
++import { UserQuotaSettings } from './UserQuotaSettings';
++import { gatewayAPI, type Policy } from './api';
++import { copyApiKeyToClipboard } from '@/components/usage/ApiKeySettingsCard';
++vi.mock('./api', () => ({ gatewayAPI: vi.fn() }));
++vi.mock('./useAccountAliases', () => ({ useAccountAliases: () => ({ names: { account: '主订阅' }, error: '', reload: vi.fn() }) }));
++vi.mock('@/components/usage/ApiKeySettingsCard', () => ({ copyApiKeyToClipboard: vi.fn() }));
++globalThis.IS_REACT_ACT_ENVIRONMENT = true;
++const users: CpaApiKeySettingsItem[] = ['A','B'].map((name, i) => ({ id: name, apiKey: `secret-${name}-12345${i}`, keyAlias: name, displayKey: 'masked', label: name, lastSyncedAt: null }));
++const policies: Policy[] = users.map((user, i) => ({ key_hash: user.id.repeat(64), alias: user.keyAlias, limit_usd: i ? 200 : 100, used_usd: i ? 80 : 20, remaining_usd: i ? 120 : 80, rpm: 37, concurrency: 2, is_superuser: false, enabled: true, cycle_type: 'calendar_month', cycle_days: 30, period_ends_at: '2026-11-01T00:00:00+08:00' }));
++const routing = { enabled: false, session_ttl_hours: 12, overflow_threshold: 3, accounts: [{ id: 'account', name: 'file.json', enabled: true, concurrency: 1, models: [] }], preferences: {} };
++describe('user quota table', () => {
++  let container: HTMLDivElement; let root: Root;
++  beforeEach(() => {
++    vi.clearAllMocks(); container=document.createElement('div');document.body.appendChild(container);root=createRoot(container);
++    vi.mocked(gatewayAPI).mockImplementation(async (path) => {
++      if (path === 'summary') return {items: structuredClone(policies)};
++      if (path === 'key-links') return {items: users.map((user,i) => ({id:user.id,key_hash:policies[i].key_hash}))};
++      if (path === 'routing') return routing;
++      if (path === 'policy') return {...policies[0], limit_usd: 150};
++      return {ok:true};
++    });
++  });
++  afterEach(async () => {await act(async () => root.unmount());container.remove();});
++  async function render(onSaveAlias=vi.fn()) {await act(async () => root.render(<UserQuotaSettings apiKeys={users} onSaveAlias={onSaveAlias} />));}
++  async function click(element: Element | null) {expect(element).not.toBeNull();await act(async () => (element as HTMLElement).click());}
++  async function change(element: HTMLInputElement, value: string) {
++    await act(async () => {Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')!.set!.call(element,value);element.dispatchEvent(new Event('input',{bubbles:true}));});
++  }
++  it('renders 10 columns and copies the full key without exposing it in markup', async () => {
++    await render();
++    expect(container.querySelectorAll('thead th')).toHaveLength(10);expect(container.querySelectorAll('.gw-user-row')).toHaveLength(2);
++    expect(container.querySelector('.gw-key-copy code')?.textContent).toBe('123450');
++    expect(container.innerHTML).not.toContain(users[0].apiKey);
++    await click(container.querySelector('.gw-key-copy'));expect(copyApiKeyToClipboard).toHaveBeenCalledWith(users[0].apiKey);
++    expect(container.querySelector('select[aria-label="优先认证账号"]')?.textContent).toContain('主订阅');
++  });
++  it('sorts numeric values in both directions without dropping unsaved row edits', async () => {
++    await render(); const input=container.querySelector('input[aria-label="用户别名"]') as HTMLInputElement;
++    await change(input,'未保存的别名');
++    await click(container.querySelector('[aria-label="按周期额度排序"]'));
++    expect(container.querySelector('.gw-key-copy code')?.textContent).toBe('123451');
++    expect((container.querySelectorAll('input[aria-label="用户别名"]')[1] as HTMLInputElement).value).toBe('未保存的别名');
++    await click(container.querySelector('[aria-label="按周期额度排序"]'));
++    expect(container.querySelector('.gw-key-copy code')?.textContent).toBe('123450');
++  });
++  it('does not overwrite hidden RPM settings and reports a partial preference failure', async () => {
++    await render();
++    const base=vi.mocked(gatewayAPI).getMockImplementation()!;
++    vi.mocked(gatewayAPI).mockImplementation(async (...args) => {if(args[0]==='preference')throw new Error('账号保存失败');return base(...args);});
++    await act(async () => container.querySelector('form.gw-row-actions')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true})));
++    const call=vi.mocked(gatewayAPI).mock.calls.find(c=>c[0]==='policy');
++    expect(call?.[2]).not.toHaveProperty('rpm');expect(container.querySelector('[role=alert]')?.textContent).toContain('额度设置已保存');
++    expect(container.querySelector('.gw-row-message')?.textContent).not.toBe('已保存');
++  });
++  it('stops subsequent saves when updating the user alias fails', async () => {
++    const onSaveAlias=vi.fn().mockRejectedValue(new Error('别名保存失败'));await render(onSaveAlias);
++    await change(container.querySelector('input[aria-label="用户别名"]') as HTMLInputElement,'新别名');
++    await act(async () => container.querySelector('form.gw-row-actions')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true})));
++    expect(onSaveAlias).toHaveBeenCalledWith('A','新别名');expect(vi.mocked(gatewayAPI).mock.calls.some(c=>c[0]==='policy')).toBe(false);
++    expect(container.querySelector('[role=alert]')?.textContent).toContain('别名保存失败');
++  });
++});
 diff --git a/web/src/features/gateway/UserQuotaSettings.tsx b/web/src/features/gateway/UserQuotaSettings.tsx
 new file mode 100644
-index 0000000..066953a
+index 0000000..170f7d6
 --- /dev/null
 +++ b/web/src/features/gateway/UserQuotaSettings.tsx
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,126 @@
 +import { useEffect, useState } from 'react';
-+import { ApiKeySettingsCard, type ApiKeySettingsCardProps } from '@/components/usage/ApiKeySettingsCard';
++import { copyApiKeyToClipboard, type ApiKeySettingsCardProps } from '@/components/usage/ApiKeySettingsCard';
++import type { CpaApiKeySettingsItem } from '@/lib/types';
 +import { gatewayAPI, type Policy, type Routing } from './api';
++import { useAccountAliases } from './useAccountAliases';
 +import './gateway.css';
-+function PolicyForm({ initial, routing, onSaved }: { initial: Policy; routing: Routing; onSaved: () => void }) {
++
++type SortField = 'alias' | 'used_usd' | 'remaining_usd' | 'limit_usd';
++const money = (value: number) => `$${value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
++
++function UserRow({ item, initial, routing, accountNames, onSaveAlias, onSaved, disabled }: {
++  item: CpaApiKeySettingsItem; initial: Policy; routing: Routing; accountNames: Record<string, string>;
++  onSaveAlias: ApiKeySettingsCardProps['onSaveAlias']; onSaved: (policy: Policy) => void; disabled: boolean;
++}) {
 +  const [draft, setDraft] = useState(initial);
++  const [policy, setPolicy] = useState(initial);
++  const [alias, setAlias] = useState(item.keyAlias);
++  const [savedAlias, setSavedAlias] = useState(item.keyAlias);
 +  const [preferred, setPreferred] = useState(routing.preferences[initial.key_hash]?.[0] ?? '');
-+  const [busy, setBusy] = useState(false); const [message, setMessage] = useState('');
-+  const save = async (e: React.FormEvent) => {
-+    e.preventDefault(); setBusy(true); setMessage('');
++  const [busy, setBusy] = useState(false);
++  const [message, setMessage] = useState('');
++  const [error, setError] = useState(false);
++  const [copied, setCopied] = useState(false);
++  const formId = `quota-user-${item.id}`;
++  const tail = item.apiKey ? item.apiKey.slice(-6) : '不可用';
++  const locked = busy || disabled;
++  const percent = policy.limit_usd > 0 ? Math.min(100, Math.max(0, policy.used_usd / policy.limit_usd * 100)) : 100;
++  useEffect(() => {
++    if (!copied) return;
++    const timer = setTimeout(() => setCopied(false), 1600);
++    return () => clearTimeout(timer);
++  }, [copied]);
++  const save = async (event: React.FormEvent) => {
++    event.preventDefault(); setBusy(true); setMessage(''); setError(false);
++    const completed: string[] = [];
 +    try {
-+      const saved = await gatewayAPI<Policy>('policy', 'PUT', { key_hash: draft.key_hash, limit_usd: draft.limit_usd, rpm: draft.rpm, concurrency: draft.concurrency, enabled: draft.enabled, is_superuser: draft.is_superuser, cycle_type: draft.cycle_type, cycle_days: draft.cycle_days });
-+      setDraft(saved);
-+      try { await gatewayAPI('preference', 'PUT', { key_hash: draft.key_hash, accounts: preferred ? [preferred] : [] }); }
-+      catch (e) { setMessage(`额度已保存，优先账号保存失败：${(e as Error).message}`); return; }
-+      setMessage('用户额度与优先账号已保存'); onSaved();
-+    } catch (e) { setMessage((e as Error).message); } finally { setBusy(false); }
++      if (alias.trim() !== savedAlias.trim()) {
++        await onSaveAlias(item.id, alias.trim()); setAlias(alias.trim()); setSavedAlias(alias.trim()); completed.push('别名');
++      }
++      const saved = await gatewayAPI<Policy>('policy', 'PUT', {
++        key_hash: draft.key_hash, limit_usd: draft.limit_usd, concurrency: draft.concurrency,
++        enabled: draft.enabled, is_superuser: draft.is_superuser, cycle_type: draft.cycle_type, cycle_days: draft.cycle_days,
++      });
++      setDraft(saved); setPolicy(saved); onSaved(saved); completed.push('额度设置');
++      await gatewayAPI('preference', 'PUT', { key_hash: draft.key_hash, accounts: preferred ? [preferred] : [] });
++      setMessage('已保存');
++    } catch (e) {
++      setError(true); setMessage(`${completed.length ? `${completed.join('、')}已保存；其余保存失败：` : ''}${(e as Error).message}`);
++    } finally { setBusy(false); }
 +  };
-+  return <form className="gw-policy" onSubmit={save}>
-+    <div className="gw-usage"><span>周期已用 <strong>${draft.used_usd.toFixed(2)}</strong></span><span>剩余 ${draft.remaining_usd.toFixed(2)}</span><progress max={Math.max(draft.limit_usd, 1)} value={draft.used_usd} /><span>周期截止 {draft.period_ends_at ? new Date(draft.period_ends_at).toLocaleString() : '—'}</span></div>
-+    <div className="gw-policy-fields">
-+      <label>周期额度（USD）<input type="number" min="0" step="0.01" required value={draft.limit_usd} onChange={e => setDraft({ ...draft, limit_usd: Number(e.target.value) })} /></label>
-+      <label>计费周期<select value={draft.cycle_type} onChange={e => setDraft({ ...draft, cycle_type: e.target.value })}><option value="calendar_month">自然月</option><option value="fixed_days">自定义天数</option></select></label>
-+      {draft.cycle_type === 'fixed_days' && <label>天数<input type="number" min="1" max="3650" step="1" required value={draft.cycle_days} onChange={e => setDraft({ ...draft, cycle_days: Number(e.target.value) })} /></label>}
-+      <label>RPM（0 不限）<input type="number" min="0" step="1" required value={draft.rpm} onChange={e => setDraft({ ...draft, rpm: Number(e.target.value) })} /></label>
-+      <label>个人并发（0 不限）<input type="number" min="0" step="1" required value={draft.concurrency} onChange={e => setDraft({ ...draft, concurrency: Number(e.target.value) })} /></label>
-+      <label>优先认证账号<select value={preferred} onChange={e => setPreferred(e.target.value)}><option value="">自动分配</option>{routing.accounts.map(a => <option value={a.id} key={a.id}>{a.name}{a.enabled ? '' : '（停用）'}</option>)}</select></label>
-+      <label className="gw-check"><input type="checkbox" checked={draft.enabled} onChange={e => setDraft({ ...draft, enabled: e.target.checked })} />启用 Key</label>
-+      <label className="gw-check"><input type="checkbox" checked={draft.is_superuser} onChange={e => setDraft({ ...draft, is_superuser: e.target.checked })} />超级用户</label>
-+      <button disabled={busy}>保存额度与账号</button><button type="button" disabled={busy} onClick={async () => {
-+        if (!window.confirm(`重置 ${draft.alias || '此用户'} 的额度并开始新周期？历史流水将保留。`)) return;
-+        setBusy(true); try { setDraft(await gatewayAPI<Policy>('policy/reset', 'POST', { key_hash: draft.key_hash })); setMessage('额度已重置'); onSaved(); } catch(e) { setMessage((e as Error).message); } finally { setBusy(false); }
-+      }}>重置额度</button>
-+    </div>{message && <p role="status">{message}</p>}
-+  </form>;
++  const reset = async () => {
++    if (!window.confirm(`重置 ${savedAlias || tail} 的额度并开始新周期？历史流水将保留。`)) return;
++    setBusy(true); setMessage(''); setError(false);
++    try {
++      const saved = await gatewayAPI<Policy>('policy/reset', 'POST', { key_hash: policy.key_hash });
++      setPolicy(saved); onSaved(saved); setMessage('额度已重置');
++    } catch (e) { setError(true); setMessage((e as Error).message); } finally { setBusy(false); }
++  };
++  return <tr className="gw-user-row">
++    <td><input form={formId} aria-label="用户别名" maxLength={50} placeholder="填写别名" value={alias} disabled={locked} onChange={e => setAlias(e.target.value)} /></td>
++    <td><button type="button" className="gw-key-copy" disabled={!item.apiKey} title="点击复制完整 API Key" aria-label={`复制 API Key，末尾 ${tail}`} onClick={async () => {
++      try { await copyApiKeyToClipboard(item.apiKey); setCopied(true); }
++      catch { setError(true); setMessage('复制失败，请重试'); }
++    }}><code>{tail}</code><span>{copied ? '已复制' : '点击复制'}</span></button></td>
++    <td className="gw-user-usage"><div><span>已用 <strong>{money(policy.used_usd)}</strong></span><span>剩余 <strong>{money(policy.remaining_usd)}</strong></span></div>
++      <progress aria-label="周期额度使用进度" max={100} value={percent} className={percent >= 90 ? 'gw-progress-warning' : ''} />
++      <small>重置 {policy.period_ends_at ? new Date(policy.period_ends_at).toLocaleString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }) : '—'}</small></td>
++    <td><input form={formId} aria-label="周期额度（USD）" type="number" min="0" step="0.01" required value={draft.limit_usd} disabled={locked} onChange={e => setDraft({ ...draft, limit_usd: Number(e.target.value) })} /></td>
++    <td><div className="gw-cycle"><select form={formId} aria-label="计费周期" value={draft.cycle_type} disabled={locked} onChange={e => setDraft({ ...draft, cycle_type: e.target.value })}><option value="calendar_month">自然月</option><option value="fixed_days">自定义天数</option></select>
++      {draft.cycle_type === 'fixed_days' && <label><input form={formId} aria-label="计费天数" type="number" min="1" max="3650" step="1" required value={draft.cycle_days} disabled={locked} onChange={e => setDraft({ ...draft, cycle_days: Number(e.target.value) })} /><span>天</span></label>}</div></td>
++    <td><input form={formId} aria-label="个人并发（0 不限）" title="0 表示只受总并发限制" type="number" min="0" step="1" required value={draft.concurrency} disabled={locked} onChange={e => setDraft({ ...draft, concurrency: Number(e.target.value) })} /></td>
++    <td><select form={formId} aria-label="优先认证账号" value={preferred} disabled={locked} onChange={e => setPreferred(e.target.value)}><option value="">自动分配</option>{routing.accounts.map(a => <option value={a.id} key={a.id}>{accountNames[a.id] || a.name}{a.enabled ? '' : '（停用）'}</option>)}</select></td>
++    <td className="gw-checkbox-cell"><input form={formId} aria-label="启用 Key" type="checkbox" checked={Boolean(draft.enabled)} disabled={locked} onChange={e => setDraft({ ...draft, enabled: e.target.checked })} /></td>
++    <td className="gw-checkbox-cell"><input form={formId} aria-label="超级用户" type="checkbox" checked={Boolean(draft.is_superuser)} disabled={locked} onChange={e => setDraft({ ...draft, is_superuser: e.target.checked })} /></td>
++    <td><form id={formId} className="gw-row-actions" onSubmit={save}><button type="button" disabled={locked} onClick={() => void reset()}>重置额度</button><button type="submit" className="gw-save" disabled={locked}>{busy ? '保存中…' : '保存设置'}</button></form>
++      {message && <span className={`gw-row-message${error ? ' gw-error' : ''}`} role={error ? 'alert' : 'status'}>{message}</span>}</td>
++  </tr>;
 +}
++
 +export function UserQuotaSettings(props: ApiKeySettingsCardProps & { onSyncKeys?: () => Promise<void> }) {
 +  const [policies, setPolicies] = useState<Record<string, Policy>>({});
 +  const [links, setLinks] = useState<Record<string, string>>({});
 +  const [routing, setRouting] = useState<Routing | null>(null);
 +  const [message, setMessage] = useState('');
 +  const [search, setSearch] = useState('');
-+  const [sort, setSort] = useState(false);
++  const [sort, setSort] = useState<{ field: SortField; ascending: boolean } | null>(null);
 +  const [revision, setRevision] = useState(0);
 +  const [busy, setBusy] = useState(false);
++  const aliases = useAccountAliases();
 +  const bulk = async (action: 'enable' | 'disable' | 'reset') => {
 +    const label = action === 'enable' ? '启用全部 Key' : action === 'disable' ? '停用全部 Key' : '重置全部用户额度';
 +    if (!window.confirm(`${label}？此操作包含搜索结果之外的全部用户。`)) return;
@@ -479,14 +641,26 @@ index 0000000..066953a
 +      .catch(e => { if (!controller.signal.aborted) setMessage(e.message); });
 +    return () => controller.abort();
 +  }, [revision]);
-+  const users = props.apiKeys.filter(k => `${k.keyAlias} ${k.displayKey}`.toLowerCase().includes(search.toLowerCase())).sort((a,b) => sort ? (policies[links[b.id]]?.used_usd ?? 0) - (policies[links[a.id]]?.used_usd ?? 0) : 0);
-+  return <div className="gw-users"><div className="gw-inline"><input aria-label="搜索用户" placeholder="搜索用户 / API Key" value={search} onChange={e => setSearch(e.target.value)} /><label className="gw-check"><input type="checkbox" checked={sort} onChange={e => setSort(e.target.checked)} />按用量排序</label><button disabled={busy} onClick={() => void bulk('enable')}>启用全部 Key</button><button disabled={busy} onClick={() => void bulk('disable')}>停用全部 Key</button><button disabled={busy} onClick={() => void bulk('reset')}>重置全部额度</button><button disabled={busy} onClick={async () => { setBusy(true); try { await gatewayAPI('sync', 'POST'); await props.onSyncKeys?.(); setRevision(value => value + 1); setMessage('用户与价格已同步'); } catch(e) { setMessage((e as Error).message); } finally { setBusy(false); } }}>同步用户与价格</button></div>
-+    {message && <p role="alert">{message}</p>}
-+    <ApiKeySettingsCard {...props} apiKeys={users} title="API Key 与用户限额" renderPolicy={item => {
-+      const policy = policies[links[item.id]];
-+      return policy && routing ? <PolicyForm key={`${policy.key_hash}-${revision}`} initial={policy} routing={routing} onSaved={() => {}} /> : <p role="status">{message ? '限额读取失败' : '正在同步用户限额…'}</p>;
-+    }} />
-+  </div>;
++  const users = props.apiKeys.filter(k => `${k.keyAlias} ${k.apiKey.slice(-6)}`.toLowerCase().includes(search.toLowerCase())).sort((a, b) => {
++    if (!sort) return 0;
++    const difference = sort.field === 'alias' ? a.keyAlias.localeCompare(b.keyAlias, 'zh-CN') : (policies[links[a.id]]?.[sort.field] ?? 0) - (policies[links[b.id]]?.[sort.field] ?? 0);
++    return (sort.ascending ? difference : -difference) || a.id.localeCompare(b.id);
++  });
++  const sortButton = (field: SortField, label: string) => <button className="gw-sort" type="button" aria-label={`按${label}排序`} onClick={() => setSort({ field, ascending: sort?.field === field ? !sort.ascending : field === 'alias' })}>{label}<span aria-hidden="true">{sort?.field === field ? sort.ascending ? ' ↑' : ' ↓' : ' ↕'}</span></button>;
++  const ariaSort = (fields: SortField[]) => sort && fields.includes(sort.field) ? sort.ascending ? 'ascending' as const : 'descending' as const : 'none' as const;
++  return <section className="gw-card gw-users"><div className="gw-heading"><div><h2>API Key 与用户限额</h2><p>每位用户一行，编辑后点击“保存设置”。API Key 仅显示末 6 位，点击可复制完整 Key。</p></div><span className="gw-user-count">{users.length} 位用户</span></div>
++    <div className="gw-inline gw-user-tools"><input aria-label="搜索用户" placeholder="搜索别名 / Key 末 6 位" value={search} onChange={e => setSearch(e.target.value)} /><button disabled={busy} onClick={() => void bulk('enable')}>启用全部 Key</button><button disabled={busy} onClick={() => void bulk('disable')}>停用全部 Key</button><button disabled={busy} onClick={() => void bulk('reset')}>重置全部额度</button><button disabled={busy} onClick={async () => { setBusy(true); try { await gatewayAPI('sync', 'POST'); await props.onSyncKeys?.(); setRevision(value => value + 1); setMessage('用户与价格已同步'); } catch(e) { setMessage((e as Error).message); } finally { setBusy(false); } }}>同步用户与价格</button></div>
++    {message && <p role="status">{message}</p>}
++    {aliases.error && <p role="alert">认证账号别名加载失败，暂显示已保存的账号名称。<button onClick={aliases.reload}>重试</button></p>}
++    <div className="gw-table-wrap gw-users-scroll" role="region" aria-label="用户限额表格，可横向滚动" tabIndex={0}><table className="gw-table gw-users-table">
++      <colgroup>{['128','86','216','104','140','88','176','68','76','174'].map(width => <col key={width} style={{ width: `${width}px` }} />)}</colgroup>
++      <thead><tr><th scope="col" aria-sort={ariaSort(['alias'])}>{sortButton('alias','别名')}</th><th scope="col">API Key</th><th scope="col" aria-sort={ariaSort(['used_usd','remaining_usd'])}><div className="gw-usage-heading">{sortButton('used_usd','周期已用')}{sortButton('remaining_usd','剩余额度')}</div><small>使用进度 / 重置时间</small></th><th scope="col" aria-sort={ariaSort(['limit_usd'])}>{sortButton('limit_usd','周期额度')}<small>USD</small></th><th scope="col">计费周期</th><th scope="col">个人并发<small>0 不限</small></th><th scope="col">优先认证账号</th><th scope="col" className="gw-checkbox-cell">启用 Key</th><th scope="col" className="gw-checkbox-cell">超级用户</th><th scope="col">操作</th></tr></thead>
++      <tbody>{users.map(item => {
++        const policy = policies[links[item.id]];
++        return policy && routing ? <UserRow key={`${item.id}-${revision}`} item={item} initial={policy} routing={routing} accountNames={aliases.names} onSaveAlias={props.onSaveAlias} disabled={busy || props.savingId === item.id} onSaved={saved => setPolicies(previous => ({ ...previous, [saved.key_hash]: saved }))} /> : <tr key={item.id}><td>{item.keyAlias || '未命名'}</td><td colSpan={9}>{message ? '限额读取失败，请同步后重试' : '正在同步用户限额…'}</td></tr>;
++      })}{users.length === 0 && <tr><td colSpan={10} className="gw-empty">{props.loading ? '正在加载用户…' : search ? '没有匹配的用户' : '暂无用户'}</td></tr>}</tbody>
++    </table></div>
++  </section>;
 +}
 diff --git a/web/src/features/gateway/api.ts b/web/src/features/gateway/api.ts
 new file mode 100644
@@ -507,13 +681,76 @@ index 0000000..010e3a5
 +}
 diff --git a/web/src/features/gateway/gateway.css b/web/src/features/gateway/gateway.css
 new file mode 100644
-index 0000000..084fab7
+index 0000000..73c85bf
 --- /dev/null
 +++ b/web/src/features/gateway/gateway.css
-@@ -0,0 +1,3 @@
+@@ -0,0 +1,8 @@
 +.gw-card{padding:22px;border:1px solid var(--border-color,#dfe3eb);border-radius:16px;background:var(--bg-primary,#fff);color:var(--text-primary,#202938);margin-bottom:20px;box-shadow:0 3px 14px #152a4810}.gw-heading{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}.gw-card h2{font-size:18px;margin:0 0 7px}.gw-card p{color:var(--text-secondary,#68758b);font-size:13px;line-height:1.65;margin:4px 0 16px}.gw-status{font-size:12px;color:#15976e;border:1px solid #91ddc1;border-radius:20px;padding:6px 12px}.gw-error{color:#bd4352;border-color:#e9a7af}.gw-pools{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin-top:20px}.gw-pool{border:1px solid #bacbe04d;border-radius:20px;padding:18px;background:linear-gradient(180deg,#8aa4d00a,#86a1ce12);min-width:0}.gw-pool-active{border-color:#55ba934d;background:linear-gradient(180deg,#48c59708,#48c59712)}.gw-pool-personal{border-color:#a591ce4d;background:linear-gradient(180deg,#a18bd008,#a18bd012)}.gw-pool-title{display:flex;align-items:center;justify-content:space-between}.gw-pool h3{font-size:15px;margin:0}.gw-pool strong{font-size:26px;font-variant-numeric:tabular-nums}.gw-pool strong small{font-size:12px;font-weight:400;color:var(--text-secondary,#68758b)}.gw-balls{min-height:210px;max-height:360px;overflow:auto;display:flex;flex-wrap:wrap;gap:12px;align-items:flex-start;align-content:flex-start;padding:14px 2px}.gw-ball{width:64px;height:64px;flex:0 0 64px;display:flex;align-items:center;justify-content:center;border-radius:50%;color:#fff;background:radial-gradient(circle at 30% 24%,hsl(var(--user-hue) 77% 72%),hsl(var(--user-hue) 62% 43%) 70%);box-shadow:inset 0 -3px 6px #0002,0 5px 9px #22334c16;border:1px solid #ffffff60;animation:gw-arrive .35s ease-out}.gw-ball span{font-size:12px;line-height:1.2;max-width:55px;overflow-wrap:anywhere;text-align:center;text-shadow:0 1px 2px #0005}.gw-pool-active .gw-ball{animation:gw-arrive .35s ease-out,gw-breathe 3s ease-in-out infinite}.gw-pool-empty{align-self:center;display:block;width:100%;text-align:center;color:var(--text-secondary,#68758b);font-size:12px;margin-top:70px}.gw-legend{display:flex;gap:16px;flex-wrap:wrap;margin-top:18px;font-size:12px}.gw-legend span{display:flex;align-items:center;gap:6px}.gw-legend i{width:8px;height:8px;border-radius:50%}.gw-inline{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;margin:16px 0}.gw-card label,.gw-policy label{display:flex;flex-direction:column;gap:6px;font-size:12px;color:var(--text-secondary,#68758b)}.gw-card input:not([type=checkbox]),.gw-card select,.gw-policy input:not([type=checkbox]),.gw-policy select{border:1px solid var(--border-color,#d3dae5);border-radius:8px;background:var(--bg-primary,#fff);color:var(--text-primary,#202938);padding:8px 10px;min-width:0;width:100%}.gw-card input[type=number],.gw-policy input[type=number]{max-width:135px}.gw-check{flex-direction:row!important;align-items:center;gap:6px!important}.gw-card button,.gw-policy button{padding:8px 14px;border-radius:8px;border:1px solid var(--border-color,#d3dae5);background:var(--bg-secondary,#f4f6fa);color:var(--text-primary,#27364f);cursor:pointer}.gw-card button:disabled,.gw-policy button:disabled{opacity:.5;cursor:wait}.gw-table-wrap{overflow:auto;margin:16px 0}.gw-table{width:100%;border-collapse:collapse;text-align:left;font-size:13px}.gw-table th,.gw-table td{padding:12px;border-bottom:1px solid var(--border-color,#dfe3eb)}.gw-table th{font-size:12px;color:var(--text-secondary,#68758b);font-weight:500}.gw-table small{display:block;font-size:11px;color:var(--text-secondary,#68758b);overflow-wrap:anywhere;max-width:320px}.gw-help{max-width:950px}.gw-message{padding:10px;background:#7799ee12;border-radius:8px}.gw-policy{grid-column:1/-1;flex-basis:100%;width:100%;border-top:1px solid var(--border-color,#e2e7ef);padding-top:12px;margin-top:10px}.gw-usage{display:flex;flex-wrap:wrap;gap:18px;font-size:12px}.gw-policy-fields{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;margin-top:12px}.gw-policy-fields>label{min-width:100px}.gw-policy .gw-error{font-size:12px}.gw-card .gw-check input{width:auto}.gw-policy progress{width:120px;accent-color:#5497dc;height:6px}.gw-policy select{max-width:240px}@keyframes gw-arrive{from{transform:scale(.7);opacity:0}to{transform:scale(1);opacity:1}}@keyframes gw-breathe{50%{translate:0 -3px}}@media(prefers-reduced-motion:reduce){.gw-ball,.gw-pool-active .gw-ball{animation:none}}@media(max-width:800px){.gw-pools{grid-template-columns:1fr}.gw-balls{min-height:130px}.gw-pool-empty{margin-top:30px}.gw-card{padding:16px}}
 +
 +.gw-users>.gw-inline{gap:12px}.gw-users>.gw-inline>input,.gw-users>.gw-inline>button{border:1px solid var(--border-color);border-radius:10px;background:var(--bg-primary);color:var(--text-primary);padding:9px 14px;font-size:12px}.gw-users>.gw-inline>label{font-size:12px}.gw-users>.gw-inline>button{cursor:pointer}.gw-users>.gw-inline>button:disabled{opacity:.5}
++
++/* One editable record per row, with scrolling contained inside the table. */
++.gw-users{min-width:0;max-width:100%}.gw-user-count{font-size:12px;color:var(--text-secondary,#68758b);white-space:nowrap}.gw-user-tools{gap:8px;margin:18px 0}.gw-user-tools>input{width:230px!important;max-width:100%}.gw-user-tools>button{font-size:12px;white-space:nowrap}.gw-users-scroll{max-height:72vh;border:1px solid var(--border-color,#dfe3eb);border-radius:10px;margin-bottom:0;overscroll-behavior:contain}.gw-users-table{table-layout:fixed;min-width:1256px;width:100%}.gw-users-table th,.gw-users-table td{padding:14px 9px;vertical-align:middle}.gw-users-table thead th{position:sticky;top:0;z-index:2;background:var(--bg-secondary,#f4f6fa);height:62px;box-shadow:0 1px 0 var(--border-color,#dfe3eb)}.gw-users-table tbody tr:last-child td{border-bottom:0}.gw-users-table tbody tr:hover{background:var(--bg-hover,#77889908)}.gw-users-table input:not([type=checkbox]),.gw-users-table select{padding:7px 8px;font-size:12px;min-height:34px;width:100%;max-width:none}.gw-users-table input:focus,.gw-users-table select:focus{outline:2px solid #6b9de885;outline-offset:1px}.gw-users-table input[type=checkbox]{width:16px;height:16px;accent-color:#3977d5;cursor:pointer}.gw-checkbox-cell{text-align:center}.gw-card button.gw-sort{border:0;padding:0;background:none;font-size:12px;font-weight:600;white-space:nowrap;line-height:1.6}.gw-sort span{color:#6b87b3}.gw-usage-heading{display:flex;justify-content:space-between;gap:6px}.gw-users-table th small{margin-top:3px;font-size:10px;font-weight:400}.gw-card button.gw-key-copy{border:0;background:none;padding:4px 0;text-align:left;display:flex;flex-direction:column;gap:5px}.gw-key-copy code{font:600 13px ui-monospace,monospace;letter-spacing:.4px}.gw-key-copy span{font-size:10px;color:var(--text-secondary,#68758b)}.gw-key-copy:hover code{color:#3977d5}.gw-user-usage>div{display:flex;justify-content:space-between;gap:5px;font-size:10px;color:var(--text-secondary,#68758b);font-variant-numeric:tabular-nums}.gw-user-usage strong{display:block;font-size:12px;font-weight:500;color:var(--text-primary,#202938);margin-top:3px}.gw-user-usage>div>span:last-child{text-align:right}.gw-user-usage progress{display:block;appearance:none;width:100%;height:6px;border:0;border-radius:8px;overflow:hidden;margin:8px 0;background:var(--bg-secondary,#e9edf4)}.gw-user-usage progress::-webkit-progress-bar{background:var(--bg-secondary,#e9edf4)}.gw-user-usage progress::-webkit-progress-value{background:#5089dc;border-radius:8px}.gw-user-usage progress::-moz-progress-bar{background:#5089dc}.gw-user-usage progress.gw-progress-warning::-webkit-progress-value{background:#df9454}.gw-user-usage progress.gw-progress-warning::-moz-progress-bar{background:#df9454}.gw-user-usage small{font-size:10px;white-space:nowrap}.gw-cycle{display:flex;flex-direction:column;gap:6px}.gw-cycle label{display:flex;flex-direction:row;align-items:center;gap:6px}.gw-cycle label input{width:70px!important}.gw-row-actions{display:flex;align-items:center;gap:6px}.gw-card .gw-row-actions button{font-size:11px;padding:8px;white-space:nowrap}.gw-card button.gw-save{background:#3977d5;border-color:#3977d5;color:#fff}.gw-row-message{display:block;font-size:10px;margin-top:6px;line-height:1.5;color:#218161;overflow-wrap:anywhere}.gw-row-message.gw-error{color:#bd4352}.gw-empty{text-align:center;padding:28px!important;color:var(--text-secondary,#68758b)}.gw-accounts-table{min-width:900px}.gw-account-alias{display:flex;gap:8px;align-items:center;min-width:250px}.gw-account-alias input{max-width:240px}.gw-account-alias button{white-space:nowrap;font-size:12px}.gw-accounts-table td:first-child{max-width:300px}.gw-accounts-table td:first-child strong{overflow-wrap:anywhere}
++@media(max-width:800px){.gw-users-scroll{max-height:72vh}.gw-user-tools>input{width:100%!important}.gw-user-tools>button{padding:7px 9px}.gw-users-table th,.gw-users-table td{padding:12px 9px}}
++.gw-user-usage progress,.gw-user-usage progress::-webkit-progress-bar{background:color-mix(in srgb,#64b792 24%,var(--bg-primary,#fff))}
+diff --git a/web/src/features/gateway/useAccountAliases.test.ts b/web/src/features/gateway/useAccountAliases.test.ts
+new file mode 100644
+index 0000000..e49b66b
+--- /dev/null
++++ b/web/src/features/gateway/useAccountAliases.test.ts
+@@ -0,0 +1,14 @@
++import { describe, expect, it } from 'vitest';
++import type { UsageIdentity } from '@/lib/types';
++import { findAccountIdentity } from './useAccountAliases';
++const file={id:'primary.json',name:'primary.json',provider:'codex',available:true};
++const identity={id:'keeper-id',file_name:'primary.json',auth_type:1,is_deleted:false,alias:'主账号'} as UsageIdentity;
++describe('authentication file alias mapping',()=>{
++  it('uses the live auth-file identity and excludes deleted files and API providers',()=>{
++    expect(findAccountIdentity(file,[{...identity,id:'old',is_deleted:true},{...identity,id:'api',auth_type:2},identity])).toBe(identity);
++  });
++  it('does not rename an ambiguous or unmatched identity',()=>{
++    expect(findAccountIdentity(file,[identity,{...identity,id:'other'}])).toBeUndefined();
++    expect(findAccountIdentity({...file,id:'missing',name:'missing'},[identity])).toBeUndefined();
++  });
++});
+diff --git a/web/src/features/gateway/useAccountAliases.ts b/web/src/features/gateway/useAccountAliases.ts
+new file mode 100644
+index 0000000..d4bdab5
+--- /dev/null
++++ b/web/src/features/gateway/useAccountAliases.ts
+@@ -0,0 +1,32 @@
++import { useCallback, useEffect, useState } from 'react';
++import { fetchUsageIdentities } from '@/lib/api';
++import type { UsageIdentity } from '@/lib/types';
++import { gatewayAPI } from './api';
++
++export interface DiscoveredAccount { id: string; name: string; provider: string; available: boolean }
++export function findAccountIdentity(account: DiscoveredAccount, identities: UsageIdentity[]) {
++  const matches = identities.filter(identity => identity.auth_type === 1 && !identity.is_deleted &&
++    [identity.file_name, identity.file_path].some(name => name && (name === account.id || name === account.name)));
++  return matches.length === 1 ? matches[0] : undefined;
++}
++export function useAccountAliases() {
++  const [accounts, setAccounts] = useState<DiscoveredAccount[]>([]);
++  const [identities, setIdentities] = useState<UsageIdentity[]>([]);
++  const [error, setError] = useState('');
++  const [revision, setRevision] = useState(0);
++  const reload = useCallback(() => setRevision(value => value + 1), []);
++  useEffect(() => {
++    window.addEventListener('quota-account-alias-saved', reload);
++    return () => window.removeEventListener('quota-account-alias-saved', reload);
++  }, [reload]);
++  useEffect(() => {
++    const controller = new AbortController();
++    void Promise.all([gatewayAPI<{ accounts: DiscoveredAccount[] }>('accounts', 'GET', undefined, controller.signal), fetchUsageIdentities(controller.signal)])
++      .then(([files, data]) => { setAccounts(files.accounts); setIdentities(data.identities); setError(''); })
++      .catch(e => { if (!controller.signal.aborted) setError((e as Error).message); });
++    return () => controller.abort();
++  }, [revision]);
++  const byAccount = Object.fromEntries(accounts.map(account => [account.id, findAccountIdentity(account, identities)]));
++  const names = Object.fromEntries(accounts.map(account => [account.id, byAccount[account.id]?.alias?.trim() || account.name]));
++  return { accounts, byAccount, names, error, reload };
++}
 diff --git a/web/src/i18n/index.ts b/web/src/i18n/index.ts
 index d0de019..f46d6c3 100644
 --- a/web/src/i18n/index.ts
@@ -546,7 +783,7 @@ index d0de019..f46d6c3 100644
          console_kicker: '存取控制',
          console_title: '選擇存取方式',
 diff --git a/web/src/pages/UsagePage.tsx b/web/src/pages/UsagePage.tsx
-index 58c4cf5..a1e14d5 100644
+index 58c4cf5..e11c46e 100644
 --- a/web/src/pages/UsagePage.tsx
 +++ b/web/src/pages/UsagePage.tsx
 @@ -1,7 +1,7 @@
@@ -742,7 +979,7 @@ index 58c4cf5..a1e14d5 100644
    const handleSaveApiKeyAlias = useCallback(async (id: string, keyAlias: string) => {
      setApiKeySettingsSavingId(id);
      setApiKeySettingsError('');
-@@ -1214,10 +1123,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -1214,45 +1123,19 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
        const updated = await updateCpaApiKeyAlias(id, keyAlias);
        setApiKeySettings((current) => current.map((item) => (item.id === updated.id ? { ...item, ...updated } : item)));
        setApiKeyOptions((current) => current.map((item) => (item.id === updated.id ? updated : item)));
@@ -753,7 +990,12 @@ index 58c4cf5..a1e14d5 100644
        showTopNotice('success', t('usage_stats.api_key_settings_alias_save_success'));
      } catch (error) {
        if (error instanceof ApiError && error.status === 401) {
-@@ -1229,30 +1134,8 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+         onAuthRequired?.();
+-        return;
+       }
+       setApiKeySettingsError(error instanceof Error ? error.message : 'Failed to update CPA API key alias');
+       showTopNotice('error', t('usage_stats.api_key_settings_alias_save_failed'));
++      throw error;
      } finally {
        setApiKeySettingsSavingId(null);
      }
@@ -1031,7 +1273,7 @@ index 58c4cf5..a1e14d5 100644
  
              {credentialSectionVisibility.enabled && (
                <>
-+                {credentialSectionVisibility.showAuthFiles && <AccountRouting />}
++                {credentialSectionVisibility.showAuthFiles && <AccountRouting onSaveAlias={credentialsData.saveUsageIdentityAlias} />}
                  {credentialsData.error && <div className={styles.errorBox}>{credentialsData.error}</div>}
                  <CredentialProviderFilterBar
                    scope={activeCredentialProviderFilterScope}
@@ -1051,6 +1293,3 @@ index 58c4cf5..a1e14d5 100644
                    apiKeys={apiKeySettings}
                    loading={apiKeySettingsLoading}
                    savingId={apiKeySettingsSavingId}
--- 
-2.43.0
-

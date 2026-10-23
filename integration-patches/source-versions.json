@@ -5,7 +5,7 @@
     "dirty": false
   },
   "keeper": {
-    "commit": "1c2ac07b853388d553c99da22d39db1b4882c4d2",
+    "commit": "c2a16331c5bd18f81643bafbd776176ac0811beb",
     "branch": "gateway-integration",
     "dirty": false,
     "upstream_base": "d62cad3f345ae574089a14a4ac75cca023c7ead6"
