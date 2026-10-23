@@ -4,7 +4,7 @@
     "branch": "keeper-integration"
   },
   "keeper": {
-    "commit": "b4851935adb1957a5eb0e01fa2af06c2d446807b",
+    "commit": "2a6b63dbb59d00aa1499bd78857d76ec3bd8425a",
     "branch": "gateway-integration",
     "dirty": false,
     "upstream_base": "d62cad3f345ae574089a14a4ac75cca023c7ead6"

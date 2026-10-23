@@ -484,10 +484,10 @@ index 0000000..3608bcc
 +}
 diff --git a/internal/service/request_archive.go b/internal/service/request_archive.go
 new file mode 100644
-index 0000000..0ce7ef9
+index 0000000..30f28ab
 --- /dev/null
 +++ b/internal/service/request_archive.go
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,198 @@
 +package service
 +
 +import (
@@ -503,11 +503,15 @@ index 0000000..0ce7ef9
 +// Gateway owns these tables in the shared database. Token metadata stays in
 +// usage_events; the compressed body is never selected by statistics queries.
 +type archivedRequest struct {
-+	ReceivedAt    string
-+	Endpoint      string
-+	UserAlias     string
-+	BodyGzip      []byte
-+	OriginalBytes int64
++	ReceivedAt        string
++	Endpoint          string
++	UserAlias         string
++	BodyGzip          []byte
++	OriginalBytes     int64
++	InputState        string
++	InputDetail       string
++	PromptCount       int
++	SubsequentAttempt bool
 +}
 +
 +func (s *requestLogService) archivedRequest(ctx context.Context, requestID string) (*archivedRequest, error) {
@@ -516,7 +520,12 @@ index 0000000..0ce7ef9
 +		return nil, nil
 +	}
 +	var row archivedRequest
-+	result := db.Raw(`SELECT r.received_at, r.endpoint, r.user_alias, p.body_gzip, p.original_bytes
++	classification := "'unconfirmed' AS input_state, 'historical_boundary_unavailable' AS input_detail"
++	if db.Migrator().HasColumn("request_records", "input_state") {
++		classification = "r.input_state, r.input_detail"
++	}
++	result := db.Raw(`SELECT r.received_at, r.endpoint, r.user_alias, p.body_gzip, p.original_bytes, `+classification+`,
++        a.request_id != (SELECT request_id FROM request_attempts first_attempt WHERE first_attempt.record_id=r.id ORDER BY started_at,request_id LIMIT 1) AS subsequent_attempt
 +		FROM request_attempts a JOIN request_records r ON r.id=a.record_id
 +		JOIN request_payloads p ON p.id=r.payload_id WHERE a.request_id=? LIMIT 1`, requestID).Scan(&row)
 +	if result.Error != nil {
@@ -536,6 +545,10 @@ index 0000000..0ce7ef9
 +	refsReader.Close()
 +	if err != nil || references.IDs == nil {
 +		return nil, fmt.Errorf("invalid user prompt references")
++	}
++	if row.SubsequentAttempt {
++		references.IDs = nil
++		row.InputState, row.InputDetail = "no_new_input", "upstream_retry"
 +	}
 +	type promptRow struct {
 +		ID            string
@@ -570,7 +583,8 @@ index 0000000..0ce7ef9
 +		}
 +		ordered = append(ordered, text)
 +	}
-+	body, err := json.MarshalIndent(map[string][]string{"user_prompts": ordered}, "", "  ")
++	row.PromptCount = len(ordered)
++	body, err := json.MarshalIndent(map[string][]string{"input_texts": ordered}, "", "  ")
 +	if err != nil {
 +		return nil, err
 +	}
@@ -611,8 +625,42 @@ index 0000000..0ce7ef9
 +		return response, nil
 +	}
 +	response.Previewable = true
-+	response.Sections = []RequestLogSection{{Title: "REQUEST INFO", Content: r.info(requestID)}, {Title: "USER PROMPTS", Content: string(body)}}
++	response.Sections = []RequestLogSection{
++		{Title: "REQUEST INFO", Content: r.info(requestID)},
++		{Title: "INPUT STATUS", Content: r.InputDetail},
++	}
++	if r.PromptCount > 0 {
++		response.Sections = append(response.Sections, RequestLogSection{Title: r.inputTitle(), Content: string(body)})
++	}
 +	return response, nil
++}
++
++func (r *archivedRequest) inputTitle() string {
++	if r.InputState == "inferred_input" {
++		return "NEW INPUT (INFERRED)"
++	}
++	return "UNCONFIRMED INPUT"
++}
++
++func inputStatusDescription(detail string) string {
++	switch detail {
++	case "automatic_or_repeated_history":
++		return "No new user input detected. This request contains automatic content or repeated history."
++	case "upstream_retry":
++		return "This is an upstream retry of the same request, not a new user input."
++	case "agent_continuation":
++		return "No new user input detected. The request continues an assistant or tool step."
++	case "historical_boundary_unavailable":
++		return "Historical record: original message boundaries are unavailable; the text cannot be assigned to a confirmed user turn."
++	case "first_observed_history":
++		return "First observed conversation history: earlier text is not counted as new user input."
++	case "session_unavailable":
++		return "No stable session identifier; new input cannot be distinguished from repeated history."
++	case "user_message_after_history":
++		return "New input inferred from conversation history and message boundaries. UI authorship requires a client-side input marker."
++	default:
++		return "Input origin could not be determined."
++	}
 +}
 +
 +type archivedRequestReader struct {
@@ -625,7 +673,14 @@ index 0000000..0ce7ef9
 +	if err != nil {
 +		return RequestLogDownload{}, fmt.Errorf("open compressed request: %w", err)
 +	}
-+	prefix := "=== REQUEST INFO ===\n" + r.info(requestID) + "\n=== USER PROMPTS ===\n"
++	prefix := "=== REQUEST INFO ===\n" + r.info(requestID) + "\n=== INPUT STATUS ===\n" + inputStatusDescription(r.InputDetail) + "\n"
++	if r.PromptCount == 0 {
++		reader.Close()
++		return RequestLogDownload{EventID: eventID, RequestID: requestID,
++			Filename: "request-" + requestID + ".log", ContentType: "text/plain; charset=utf-8",
++			ContentLength: int64(len(prefix)), Downloadable: true, Body: io.NopCloser(strings.NewReader(prefix))}, nil
++	}
++	prefix += "\n=== " + r.inputTitle() + " ===\n"
 +	return RequestLogDownload{EventID: eventID, RequestID: requestID,
 +		Filename: "request-" + requestID + ".log", ContentType: "text/plain; charset=utf-8",
 +		ContentLength: int64(len(prefix)) + r.OriginalBytes, Downloadable: true,
@@ -691,10 +746,10 @@ index 35af55b..e64c90e 100644
  		if result != nil && result.StatusCode == http.StatusNotFound {
 diff --git a/internal/service/test/request_archive_test.go b/internal/service/test/request_archive_test.go
 new file mode 100644
-index 0000000..56fb0bd
+index 0000000..6da8e89
 --- /dev/null
 +++ b/internal/service/test/request_archive_test.go
-@@ -0,0 +1,102 @@
+@@ -0,0 +1,144 @@
 +package test
 +
 +import (
@@ -715,8 +770,8 @@ index 0000000..56fb0bd
 +	for _, statement := range []string{
 +		`CREATE TABLE user_prompts(id TEXT PRIMARY KEY, text_gzip BLOB, original_bytes INTEGER)`,
 +		`CREATE TABLE request_payloads(id TEXT PRIMARY KEY, body_gzip BLOB, original_bytes INTEGER)`,
-+		`CREATE TABLE request_records(id TEXT PRIMARY KEY, received_at TEXT, endpoint TEXT, user_alias TEXT, payload_id TEXT)`,
-+		`CREATE TABLE request_attempts(request_id TEXT PRIMARY KEY, record_id TEXT)`,
++		`CREATE TABLE request_records(id TEXT PRIMARY KEY, received_at TEXT, endpoint TEXT, user_alias TEXT, payload_id TEXT, input_state TEXT, input_detail TEXT)`,
++		`CREATE TABLE request_attempts(request_id TEXT PRIMARY KEY, record_id TEXT, started_at TEXT)`,
 +	} {
 +		if err := db.Exec(statement).Error; err != nil {
 +			t.Fatal(err)
@@ -741,10 +796,10 @@ index 0000000..56fb0bd
 +	if err := db.Exec(`INSERT INTO user_prompts VALUES('prompt',?,?)`, zip(body), len(body)).Error; err != nil {
 +		t.Fatal(err)
 +	}
-+	if err := db.Exec(`INSERT INTO request_records VALUES('receipt','2026-10-23T00:00:00Z','/v1/responses','小林','payload')`).Error; err != nil {
++	if err := db.Exec(`INSERT INTO request_records VALUES('receipt','2026-10-23T00:00:00Z','/v1/responses','小林','payload','inferred_input','user_message_after_history')`).Error; err != nil {
 +		t.Fatal(err)
 +	}
-+	if err := db.Exec(`INSERT INTO request_attempts VALUES('request-id','receipt')`).Error; err != nil {
++	if err := db.Exec(`INSERT INTO request_attempts VALUES('request-id','receipt','2026-10-23T00:00:00Z')`).Error; err != nil {
 +		t.Fatal(err)
 +	}
 +	event := entities.UsageEvent{EventKey: "archive-event", RequestID: "request-id"}
@@ -756,13 +811,13 @@ index 0000000..56fb0bd
 +	if err != nil {
 +		t.Fatal(err)
 +	}
-+	if !preview.Available || !preview.Previewable || len(preview.Sections) != 2 || preview.Sections[1].Title != "USER PROMPTS" {
++	if !preview.Available || !preview.Previewable || len(preview.Sections) != 3 || preview.Sections[2].Title != "NEW INPUT (INFERRED)" {
 +		t.Fatalf("unexpected preview: %+v", preview)
 +	}
 +	var decoded struct {
-+		Prompts []string `json:"user_prompts"`
++		Prompts []string `json:"input_texts"`
 +	}
-+	if err := json.Unmarshal([]byte(preview.Sections[1].Content), &decoded); err != nil {
++	if err := json.Unmarshal([]byte(preview.Sections[2].Content), &decoded); err != nil {
 +		t.Fatal(err)
 +	}
 +	if len(decoded.Prompts) != 2 || decoded.Prompts[0] != string(body) || decoded.Prompts[1] != string(body) {
@@ -781,6 +836,48 @@ index 0000000..56fb0bd
 +	}
 +	if int64(len(content)) != download.ContentLength || !strings.Contains(string(content), string(body)) {
 +		t.Fatal("download length/content mismatch")
++	}
++	if err := db.Exec(`INSERT INTO request_attempts VALUES('retry-id','receipt','2026-10-23T00:00:01Z')`).Error; err != nil {
++		t.Fatal(err)
++	}
++	retry := entities.UsageEvent{EventKey: "retry-event", RequestID: "retry-id"}
++	if err := db.Create(&retry).Error; err != nil {
++		t.Fatal(err)
++	}
++	retried, err := svc.GetUsageEventRequestLog(context.Background(), retry.ID)
++	if err != nil || len(retried.Sections) != 2 || retried.Sections[1].Content != "upstream_retry" {
++		t.Fatalf("retry repeated the original prompt: %+v, %v", retried, err)
++	}
++	// Automatic steps keep request metadata, with no prompt section in either format.
++	empty := []byte(`{"user_prompt_ids":[]}`)
++	if err := db.Exec(`UPDATE request_payloads SET body_gzip=?, original_bytes=?`, zip(empty), len(empty)).Error; err != nil {
++		t.Fatal(err)
++	}
++	if err := db.Exec(`UPDATE request_records SET input_state='no_new_input',input_detail='agent_continuation'`).Error; err != nil {
++		t.Fatal(err)
++	}
++	preview, err = svc.GetUsageEventRequestLog(context.Background(), event.ID)
++	if err != nil || len(preview.Sections) != 2 || preview.Sections[1].Title != "INPUT STATUS" || preview.Sections[1].Content != "agent_continuation" {
++		t.Fatalf("automatic step was labeled as user input: %+v, %v", preview, err)
++	}
++	download, err = svc.DownloadUsageEventRequestLog(context.Background(), event.ID)
++	if err != nil {
++		t.Fatal(err)
++	}
++	content, err = io.ReadAll(download.Body)
++	download.Body.Close()
++	if err != nil || int64(len(content)) != download.ContentLength || strings.Contains(string(content), "USER PROMPTS") || strings.Contains(string(content), "input_texts") {
++		t.Fatal("automatic download contains prompts or an invalid length")
++	}
++	if err := db.Exec(`UPDATE request_payloads SET body_gzip=?, original_bytes=?`, zip(refs), len(refs)).Error; err != nil {
++		t.Fatal(err)
++	}
++	if err := db.Exec(`UPDATE request_records SET input_state='unconfirmed',input_detail='historical_boundary_unavailable'`).Error; err != nil {
++		t.Fatal(err)
++	}
++	preview, err = svc.GetUsageEventRequestLog(context.Background(), event.ID)
++	if err != nil || preview.Sections[2].Title != "UNCONFIRMED INPUT" {
++		t.Fatalf("legacy input asserted as new: %+v, %v", preview, err)
 +	}
 +	large := []byte(strings.Repeat("x", service.RequestLogPreviewMaxBytes()+1))
 +	if err := db.Exec(`UPDATE user_prompts SET text_gzip=?,original_bytes=?`, zip(large), len(large)).Error; err != nil {
@@ -949,17 +1046,48 @@ index 391f250..a1a9d55 100644
                );
              })}
 diff --git a/web/src/components/usage/RequestEventsDetailsCard.tsx b/web/src/components/usage/RequestEventsDetailsCard.tsx
-index b005c41..20a89d3 100644
+index b005c41..236e0ea 100644
 --- a/web/src/components/usage/RequestEventsDetailsCard.tsx
 +++ b/web/src/components/usage/RequestEventsDetailsCard.tsx
-@@ -138,6 +138,7 @@ const REQUEST_LOG_SECTION_TITLE_KEYS: Record<string, string> = {
+@@ -138,6 +138,10 @@ const REQUEST_LOG_SECTION_TITLE_KEYS: Record<string, string> = {
    RESPONSE: 'usage_stats.request_events_log_section_response',
    'WEBSOCKET TIMELINE': 'usage_stats.request_events_log_section_websocket_timeline',
    'API WEBSOCKET TIMELINE': 'usage_stats.request_events_log_section_api_websocket_timeline',
++  'INPUT STATUS': 'usage_stats.request_events_log_section_input_status',
++  'NEW INPUT (INFERRED)': 'usage_stats.request_events_log_section_new_input',
++  'UNCONFIRMED INPUT': 'usage_stats.request_events_log_section_unconfirmed_input',
 +  'USER PROMPTS': 'usage_stats.request_events_log_section_user_prompts',
    'RAW LOG': 'usage_stats.request_events_log_section_raw_log',
  };
  
+@@ -153,6 +157,16 @@ const formatRequestLogSectionTitle = (
+   return title.trim() || translate('usage_stats.request_events_log_section');
+ };
+ 
++const INPUT_STATUS_KEYS: Record<string, string> = {
++  upstream_retry: 'usage_stats.request_input_retry',
++  automatic_or_repeated_history: 'usage_stats.request_input_repeated',
++  agent_continuation: 'usage_stats.request_input_continuation',
++  historical_boundary_unavailable: 'usage_stats.request_input_historical',
++  first_observed_history: 'usage_stats.request_input_baseline',
++  session_unavailable: 'usage_stats.request_input_no_session',
++  user_message_after_history: 'usage_stats.request_input_inferred',
++};
++
+ const isPreferredRequestLogChunkBreak = (character: string) =>
+   character === ','
+   || character === '}'
+@@ -1333,7 +1347,9 @@ export function RequestEventsDetailsCard({
+                     <RequestLogSectionDisclosure
+                       key={`${requestLogResponse.event_id}-${section.title}-${index}`}
+                       title={formatRequestLogSectionTitle(section.title, t)}
+-                      content={section.content}
++                      content={section.title === 'INPUT STATUS'
++                        ? t(INPUT_STATUS_KEYS[section.content] ?? 'usage_stats.request_input_unknown')
++                        : section.content}
+                       defaultOpen={index === 0}
+                     />
+                   ))}
 diff --git a/web/src/components/usage/analysis/AnalysisPanel.tsx b/web/src/components/usage/analysis/AnalysisPanel.tsx
 index 151094c..918eff2 100644
 --- a/web/src/components/usage/analysis/AnalysisPanel.tsx
@@ -1692,7 +1820,7 @@ index 0000000..d4bdab5
 +  return { accounts, byAccount, names, error, reload };
 +}
 diff --git a/web/src/i18n/index.ts b/web/src/i18n/index.ts
-index d0de019..3ff6bd9 100644
+index d0de019..f7844d3 100644
 --- a/web/src/i18n/index.ts
 +++ b/web/src/i18n/index.ts
 @@ -43,7 +43,7 @@ const resources = {
@@ -1704,15 +1832,26 @@ index d0de019..3ff6bd9 100644
          login_subtitle: 'Every flow leaves a trace.',
          console_kicker: 'Access control',
          console_title: 'Choose your console',
-@@ -275,6 +275,7 @@ const resources = {
+@@ -275,6 +275,18 @@ const resources = {
          request_events_log_copy_failed_section: 'Unable to copy {{section}}',
          request_events_log_section: 'Section',
          request_events_log_section_request_info: 'Request Info',
 +        request_events_log_section_user_prompts: 'User Prompts',
++        request_input_retry: 'This is an upstream retry of the same request, not a new user input.',
++        request_events_log_section_input_status: 'Input detection',
++        request_events_log_section_new_input: 'New input (inferred)',
++        request_events_log_section_unconfirmed_input: 'Unconfirmed input',
++        request_input_repeated: 'No new user input detected. This request contains automatic content or repeated history.',
++        request_input_continuation: 'No new user input detected. This request continues an assistant or tool step.',
++        request_input_historical: 'Historical record: message boundaries were not retained, so this text cannot be confirmed as new input for this request.',
++        request_input_baseline: 'First observed conversation history. Earlier text is not counted as new input for this request.',
++        request_input_no_session: 'No stable session identifier. New input cannot be distinguished from repeated history.',
++        request_input_inferred: 'New input inferred from message boundaries and conversation history. The API cannot confirm whether it was typed in the input box.',
++        request_input_unknown: 'The origin of this input could not be determined.',
          request_events_log_section_headers: 'Headers',
          request_events_log_section_api_request: 'API Request',
          request_events_log_section_api_response: 'API Response',
-@@ -790,7 +791,7 @@ const resources = {
+@@ -790,7 +802,7 @@ const resources = {
          no_requests: '暂无请求'
        },
        auth: {
@@ -1721,15 +1860,26 @@ index d0de019..3ff6bd9 100644
          login_subtitle: '万千流转，皆有迹可循。',
          console_kicker: '访问控制',
          console_title: '选择访问方式',
-@@ -1022,6 +1023,7 @@ const resources = {
+@@ -1022,6 +1034,18 @@ const resources = {
          request_events_log_copy_failed_section: '无法复制{{section}}',
          request_events_log_section: '日志段落',
          request_events_log_section_request_info: '请求信息',
 +        request_events_log_section_user_prompts: '用户提示词',
++        request_input_retry: '这是同一请求的上游重试，不是新的用户输入。',
++        request_events_log_section_input_status: '输入判断',
++        request_events_log_section_new_input: '本次新增输入（推断）',
++        request_events_log_section_unconfirmed_input: '待确认输入',
++        request_input_repeated: '本次未发现新增用户输入，内容属于自动步骤或重复携带的历史。',
++        request_input_continuation: '本次未发现新增用户输入，请求在继续执行助手或工具步骤。',
++        request_input_historical: '这是历史记录，未保留原始消息边界，无法确认这些文字是否为本次请求的新增输入。',
++        request_input_baseline: '这是首次观测到的会话历史，较早的文字不计为本次新增输入。',
++        request_input_no_session: '缺少稳定的会话标识，无法区分新增输入和重复历史。',
++        request_input_inferred: '根据消息边界和会话历史推断为新增输入；仅凭 API 请求无法确认是否来自用户输入框。',
++        request_input_unknown: '暂时无法判断输入来源。',
          request_events_log_section_headers: '请求头',
          request_events_log_section_api_request: 'API 请求',
          request_events_log_section_api_response: 'API 响应',
-@@ -1537,7 +1539,7 @@ const resources = {
+@@ -1537,7 +1561,7 @@ const resources = {
          no_requests: '尚無請求'
        },
        auth: {
@@ -1738,11 +1888,22 @@ index d0de019..3ff6bd9 100644
          login_subtitle: '萬千流轉，皆有跡可循。',
          console_kicker: '存取控制',
          console_title: '選擇存取方式',
-@@ -1769,6 +1771,7 @@ const resources = {
+@@ -1769,6 +1793,18 @@ const resources = {
          request_events_log_copy_failed_section: '無法複製{{section}}',
          request_events_log_section: '日誌段落',
          request_events_log_section_request_info: '請求資訊',
 +        request_events_log_section_user_prompts: '使用者提示詞',
++        request_input_retry: '這是同一請求的上游重試，不是新的使用者輸入。',
++        request_events_log_section_input_status: '輸入判斷',
++        request_events_log_section_new_input: '本次新增輸入（推斷）',
++        request_events_log_section_unconfirmed_input: '待確認輸入',
++        request_input_repeated: '本次未發現新增使用者輸入，內容屬於自動步驟或重複攜帶的歷史。',
++        request_input_continuation: '本次未發現新增使用者輸入，請求正在繼續執行助手或工具步驟。',
++        request_input_historical: '這是歷史記錄，未保留原始訊息邊界，無法確認這些文字是否為本次請求的新增輸入。',
++        request_input_baseline: '這是首次觀測到的對話歷史，較早的文字不計為本次新增輸入。',
++        request_input_no_session: '缺少穩定的對話識別碼，無法區分新增輸入和重複歷史。',
++        request_input_inferred: '根據訊息邊界和對話歷史推斷為新增輸入；僅憑 API 請求無法確認是否來自使用者輸入框。',
++        request_input_unknown: '暫時無法判斷輸入來源。',
          request_events_log_section_headers: '請求標頭',
          request_events_log_section_api_request: 'API 請求',
          request_events_log_section_api_response: 'API 回應',
