@@ -22,13 +22,16 @@ own SQLite database.
 
 ## Features
 
+- Optional delayed Pro failover: a backup Codex API is exposed only after
+  Codex OAuth requests fail continuously for the configured window; any OAuth
+  success immediately disables the backup again
 - Per-user USD quota with atomic pre-authorization before forwarding a request
 - Independent billing cycle for every API key
 - Reset one user at any time; the next cycle starts at the reset timestamp
 - Reset all active Keeper users with one confirmed action
 - Calendar-month or fixed-day cycles, with configurable quota, RPM, concurrency, and enable state
-- API keys and aliases synchronized from Keeper every five minutes
-- Model prices synchronized from Keeper every five minutes and cached locally
+- API keys, aliases, and model prices synchronized from Keeper at the configured
+  `KEEPER_SYNC_INTERVAL_SECONDS` interval (60 seconds in the production setup)
 - Actual token cost settled from CLIProxyAPI's authenticated `usage` subscription
 - Immediate reservation release when CLIProxyAPI returns a non-success status or the connection fails before a response
 - Non-streaming and SSE streaming proxy support
@@ -52,7 +55,7 @@ Each user has a separate `period_started_at` and `period_ends_at`.
 ## Requirements
 
 - Linux with Python 3.10 or newer
-- Python `requests` package
+- Python `requests` and `PyYAML` packages
 - CLIProxyAPI with `usage-statistics-enabled: true`
 - CPA Usage Keeper with authentication enabled
 - Nginx or another TLS reverse proxy
@@ -110,22 +113,60 @@ The provided unit uses a systemd dynamic user and writes only to
 | `LISTEN_HOST` | `127.0.0.1` | Gateway bind address; keep it private |
 | `LISTEN_PORT` | `8320` | Gateway proxy and admin port |
 | `UPSTREAM_URL` | `http://127.0.0.1:8317` | CLIProxyAPI upstream |
+| `UPSTREAM_HEADER_RETRY_ATTEMPTS` | `2` | Retries before forwarding response headers for upstream 500/502/503/504 or transport errors; `0` retries indefinitely, positive values add that many retries, and `-1` disables local replay |
+| `UPSTREAM_HEADER_RETRY_BUDGET_SECONDS` | `0` | Total header-retry budget; `0` waits indefinitely |
+| `UPSTREAM_HEADER_ATTEMPT_TIMEOUT_SECONDS` | `0` | Maximum wait for headers on one upstream attempt; `0` waits indefinitely |
+| `UPSTREAM_STREAM_TIMEOUT_SECONDS` | `0` | Socket timeout after response headers have been forwarded; `0` waits indefinitely |
+| `UPSTREAM_MAX_ATTEMPTS_PER_REQUEST` | `3` | Shared attempt ceiling across client reconnects; `0` removes the ceiling but still prevents concurrent duplicate execution |
+| `UPSTREAM_RETRY_MAX_BACKOFF_SECONDS` | `30` | Maximum exponential retry backoff, with jitter |
+| `UPSTREAM_FAILURE_COOLDOWN_SECONDS` | `60` | Suppress identical failed requests before allowing a fresh attempt budget |
+| `UPSTREAM_LARGE_REQUEST_BYTES` | `2097152` | Request size at which the long-header policy applies |
+| `UPSTREAM_LARGE_REQUEST_HEADER_TIMEOUT_SECONDS` | `0` | Header wait for one large-request attempt; `0` waits indefinitely |
+| `UPSTREAM_LARGE_REQUEST_RETRY_ATTEMPTS` | `2` | Retries for a large request before the first response byte; `0` retries indefinitely, `-1` disables replay, and no POST is replayed after the first byte |
+| `UPSTREAM_LARGE_REQUEST_RETRY_BUDGET_SECONDS` | `0` | Total large-request header wait budget; `0` waits indefinitely |
+| `CPA_CONFIG_PATH` | adjacent CPA `config.yaml` | CPA configuration controlled by delayed failover |
+| `PRO_FAILOVER_ENABLED` | `true` | Enable delayed Pro OAuth failover gating |
+| `PRO_FAILOVER_WINDOW_SECONDS` | `600` | Required span from first to latest failure; any success resets it |
 | `KEEPER_URL` | `http://127.0.0.1:8318` | Keeper admin API |
+| `KEEPER_SYNC_INTERVAL_SECONDS` | `60` | Interval for refreshing Keeper API keys and model prices while running; minimum 5 seconds |
 | `KEEPER_LOGIN_PASSWORD` | required | Keeper admin password for metadata sync |
 | `CPA_MANAGEMENT_KEY` | required | CLIProxyAPI usage subscription authentication |
 | `QUOTA_DB` | `data/quota.db` | Durable quota SQLite path |
 | `BILLING_TIMEZONE` | `Asia/Shanghai` | Period boundary display and calendar arithmetic |
 | `DEFAULT_BUDGET_USD` | `1000` | Initial cycle quota for newly synchronized users |
-| `DEFAULT_RPM` | `120` | Initial per-key request limit per minute; `0` disables it |
-| `DEFAULT_CONCURRENCY` | `20` | Initial concurrent in-flight limit; `0` disables it |
+| `DEFAULT_RPM` | `0` | Initial per-key request rate; `0` means unlimited, and a positive value queues for capacity instead of returning 429 |
+| `DEFAULT_CONCURRENCY` | `0` | Initial personal allowance under contention; spare global slots may be borrowed, and `0` means only the global limit applies |
+| `GLOBAL_CONCURRENCY` | `10` | Initial total executing request limit; the value saved in the admin UI takes precedence, and `0` disables the global ceiling |
 | `RESERVATION_USD` | `2` | Minimum request pre-authorization |
-| `RESERVATION_TTL_SECONDS` | `3600` | Stale reservation lifetime |
+| `RESERVATION_TTL_SECONDS` | `0` | Keep reservations until usage settlement; a positive value enables orphan cleanup after that many seconds |
 | `DEFAULT_MAX_OUTPUT_TOKENS` | `128000` | Conservative bound when the request omits a limit |
 | `QUOTA_ADMIN_TOKEN` | required | Admin UI/API password |
-| `KEEPER_DB` | sibling Keeper DB | Optional one-time history import source |
+| `KEEPER_USAGE_SYNC_INTERVAL_SECONDS` | `30` | Interval for replaying durable Keeper usage events; minimum 5 seconds |
+| `KEEPER_USAGE_BATCH_SIZE` | `250` | Keeper usage events replayed per batch |
+| `KEEPER_DB` | sibling Keeper DB | Keeper SQLite path used for durable usage replay and history backfill |
 
 Changing a default affects only API keys synchronized for the first time.
 Existing user policies remain unchanged.
+
+### Reliability Semantics
+
+- The gateway and Nginx impose no request-body size cap. Long Codex histories are read and forwarded in full.
+- A zero timeout or time budget means unlimited waiting for a live attempt. Recoverable failures use at most three shared attempts by default, with exponential backoff and a 60-second cooldown.
+- A disconnect after bytes have been sent cannot be replayed safely as a POST. The gateway releases the reservation; clients can retry with the same `X-Client-Request-Id` when their API supports it.
+- Identical bodies for the same key, method, and path share a fingerprint even if the client request ID changes. Concurrent duplicates receive `409 duplicate_request_in_flight`; failed requests in cooldown receive `409 duplicate_retry_limit` with `Retry-After`.
+- A background monitor cancels upstream work when the downstream client disconnects. Zero-token failure events are observed for failover but do not write the quota ledger or release an unrelated live reservation; successful and billable events retain normal settlement.
+- The cycle USD quota remains an intentional accounting boundary and returns `429 quota_exceeded` when exhausted. RPM and concurrency settings never reject a request; positive values only make it wait for capacity.
+- The global queue holds at most ten executing requests by default, including their complete streams and retry loops. Requests first wait for a personal permit, then join the global queue. Personal permits cover executing requests and requests waiting in the global queue, independently of unsettled billing reservations. Waiting requests do not reserve quota or call CPA. Disconnected clients leave either queue, and duplicate fingerprints are rejected before queuing. `/admin/health` exposes the concurrency limit, executing count, and both queue counts. The limit applies to one gateway process; run one production instance.
+
+### Concurrency and Priority Controls
+
+The admin page includes a global concurrency input, live executing/personal-waiting/global-waiting counts, a personal concurrency input for each key, and an immediately saved superuser switch. Global limits and personal policies persist in SQLite and apply immediately, including to already queued requests. Reducing the global limit lets existing requests finish before admitting more. A personal limit of `0` means only the global limit applies.
+
+Requests wait in personal FIFO order until a personal permit is available, then join the tail of the global queue. The global queue gives superusers priority and preserves global-entry order within each priority class, not original request arrival order. For example, A arrives at 09:45 but cannot leave its personal queue until 09:48; B enters the global queue at 09:47. With equal priority, B executes before A.
+
+When no other user is waiting in either queue, a user may bypass its personal allowance to borrow free global slots. For example, with a global limit of `4` and a personal allowance of `2`, one user can execute four requests while other users are idle; a fifth waits. Borrowing never exceeds the global limit or interrupts existing work. Once another user queues, borrowing stops until no other user is waiting; eligible global requests receive the next released slots. New and migrated users default to normal priority, and enabled status and quotas still apply. Continuous eligible superuser traffic can delay normal users.
+
+`GET /admin/concurrency` returns `limit`, `active`, `queued`, `personal_queued`, and `global_queued` (`queued` is the sum of both stages); `PUT /admin/concurrency` accepts `{"global_limit":10}`. `PUT /admin/policy` accepts `concurrency` (non-negative integer) and `is_superuser` (boolean), together with `key_hash`. Mutations require the usual admin authentication and `X-Quota-Admin-Request: 1` header.
 
 ## Keeper Synchronization
 
@@ -150,7 +191,10 @@ A failed synchronization is rolled back and retains the last successful cache.
 The gateway immediately hashes each API key with SHA-256. Only the hash, a
 masked hint, and the alias are persisted. A failed Keeper sync retains the last
 successful key and price snapshot, so temporary Keeper downtime does not stop
-API traffic.
+API traffic. Redis remains the low-latency usage path; the gateway also replays
+Keeper's durable `usage_events` table by monotonically increasing `id`, with a
+checkpoint in its own `settings` table, so subscriber disconnects and restarts
+do not leave reservations stuck.
 
 Run an immediate synchronization with:
 
@@ -171,9 +215,10 @@ location /v1/ {
     proxy_http_version 1.1;
     proxy_buffering off;
     proxy_request_buffering off;
-    proxy_connect_timeout 10s;
-    proxy_send_timeout 900s;
-    proxy_read_timeout 900s;
+    proxy_connect_timeout 75s;
+    proxy_send_timeout 365d;
+    proxy_read_timeout 365d;
+    proxy_next_upstream off;
 
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
@@ -205,7 +250,9 @@ Then open `http://127.0.0.1:8320/admin/` and sign in with:
 
 The UI can edit each user's quota, cycle rule, RPM, concurrency, and enable
 state. A cycle can be a calendar month, 7 days, 30 days, or a custom 1-3650
-days. Aliases are read-only because Keeper is their source of truth.
+days. Aliases are read-only because Keeper is their source of truth. Positive
+RPM/concurrency values queue requests instead of returning `429`; keep them at
+`0` when no artificial throttling is desired.
 
 ## User Query Endpoints
 
@@ -262,9 +309,8 @@ python3 gateway.py --backfill-keeper-month
 ```
 
 Set `KEEPER_DB` to Keeper's SQLite path and run it with filesystem access to
-both databases. The import is idempotent. It is only a migration adapter;
-normal real-time operation uses Keeper's HTTP API and CLIProxyAPI's usage
-subscription rather than reading Keeper's database.
+both databases. The import is idempotent. Normal operation uses the Redis
+subscription for low latency and Keeper's SQLite event log for durable catch-up.
 
 ## Verification
 
@@ -310,3 +356,23 @@ open port 8317 publicly.
 ## License
 
 MIT
+
+## Recovery from transient upstream failures
+
+Set `UPSTREAM_TRANSIENT_RECOVERY_SECONDS=600` to start a ten-minute recovery
+window after the first transient failure. Set both header retry-attempt options
+and `UPSTREAM_MAX_ATTEMPTS_PER_REQUEST` to `0` to use this window instead of
+an attempt ceiling. A 15-second initial backoff and 60-second cap are recommended;
+valid upstream `Retry-After` delays are honored. Initially healthy long turns
+keep their existing timeout policy.
+
+Retries stop on client cancellation and only occur before downstream output.
+Authentication and quota errors are forwarded directly. If recovery fails,
+the last upstream HTTP status and error body are retained, including reconnects
+during cooldown. Error responses over 16 KiB are forwarded without retrying.
+A gateway-generated error is used only when no upstream response is available.
+
+CC Switch's Codex first-byte timeout must exceed the recovery window (900 seconds
+is recommended). Increase shorter idle timeouts as well; the actual Codex provider
+can use `stream_idle_timeout_ms = 900000`. The gateway cannot resume a turn that
+the client has already ended.

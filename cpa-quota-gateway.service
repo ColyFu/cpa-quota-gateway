@@ -13,6 +13,11 @@ ExecStart=/usr/bin/python3 /opt/cpa-quota-gateway/gateway.py
 Restart=always
 RestartSec=5s
 TimeoutStopSec=30s
+# Long Codex/SSE requests use one socket per client; leave headroom for bursts.
+LimitNOFILE=524288
+# One worker thread is used per client connection; do not impose a small
+# systemd task ceiling on concurrent long-lived responses.
+TasksMax=infinity
 StateDirectory=cpa-quota-gateway
 NoNewPrivileges=true
 PrivateTmp=true

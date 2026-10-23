@@ -4,10 +4,14 @@ __pycache__/
 .coverage
 
 gateway.env
+gateway.env.*
+!gateway.env.example
+*.conf.work
 *.local.env
 .env
 
 data/
+backups/
 *.db
 *.db-*
 *.sqlite
