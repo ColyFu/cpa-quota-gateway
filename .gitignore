@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .coverage
+.integration-build/
 
 gateway.env
 gateway.env.*

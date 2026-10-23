@@ -1,5 +1,7 @@
 # CPA Quota Gateway
 
+Keeper 整合控制台、账号调度与构建说明见 [整合版说明](INTEGRATION.zh-CN.md)。旧版生产基线保留在 `main` 分支（`2408701`）。
+
 简体中文 | [English](README.md)
 
 `cpa-quota-gateway` 是部署在 CLIProxyAPI 前面的独立额度和限流网关。它从

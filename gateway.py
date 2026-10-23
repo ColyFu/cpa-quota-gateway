@@ -15,6 +15,8 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from failover import ProFailoverGate
+from routing import AccountRouter, RoutingUnavailable, session_identity
+import unified
 
 try:
     import requests
@@ -511,6 +513,10 @@ class ConcurrencyQueue:
         self.policies = {}
         self.personal_waiting = deque()
         self.global_waiting = deque()
+        self.router = None
+        self.tasks = {}
+        self.running = {}
+        self.active_by_account = {}
 
     def set_limit(self, limit):
         with self.condition:
@@ -526,6 +532,7 @@ class ConcurrencyQueue:
     def promote_ticket(self, ticket):
         self.personal_waiting.remove(ticket)
         self.global_waiting.append(ticket)
+        self.tasks[ticket[0]]['stage'] = 'global'
         self.pending_by_key[ticket[1]] = self.pending_by_key.get(ticket[1], 0) + 1
 
     def promote_waiters(self):
@@ -545,6 +552,8 @@ class ConcurrencyQueue:
         selected = None
         for ticket in self.global_waiting:
             policy = self.policies[ticket[1]]
+            if not self.account_ready(ticket):
+                continue
             if policy['concurrency'] and self.active_by_key.get(ticket[1], 0) >= policy['concurrency']:
                 continue
             if policy['is_superuser']:
@@ -558,15 +567,33 @@ class ConcurrencyQueue:
         if len(waiting_keys) != 1:
             return None
         if self.global_waiting:
-            return self.global_waiting[0]
-        ticket = self.personal_waiting[0]
+            return next((t for t in self.global_waiting if self.account_ready(t)), None)
+        ticket = next((t for t in self.personal_waiting if self.account_ready(t)), None)
+        if ticket is None:
+            return None
         self.promote_ticket(ticket)
         return ticket
+
+    def account_ready(self, ticket):
+        identity = self.tasks[ticket[0]]['account_id']
+        return not self.router or self.router.ready(identity, self.active_by_account)
 
     def acquire(self, request, key_hash='', personal_limit=0, is_superuser=False):
         ticket = (object(), key_hash)
         admitted = False
         with self.condition:
+            account_id = ''
+            if self.router and getattr(request, 'route_account', True):
+                waiting = {}
+                for task in self.tasks.values():
+                    if task['stage'] != 'active' and task['account_id']:
+                        waiting[task['account_id']] = waiting.get(task['account_id'], 0) + 1
+                account_id = self.router.choose(key_hash, getattr(request, 'session_hash', ''), getattr(request, 'model', ''), self.active_by_account, waiting)
+            request.account_id = account_id
+            request.task_ticket = ticket[0]
+            self.tasks[ticket[0]] = {'id': secrets.token_hex(8), 'key_hash': key_hash,
+                'name': getattr(request, 'alias', '') or '未命名用户', 'model': getattr(request, 'model', ''),
+                'created_at': time.time(), 'account_id': account_id, 'stage': 'personal'}
             self.policies.setdefault(key_hash, {'concurrency': personal_limit, 'is_superuser': bool(is_superuser)})
             self.personal_waiting.append(ticket)
             self.promote_waiters()
@@ -574,16 +601,25 @@ class ConcurrencyQueue:
                 while True:
                     if SHUTDOWN_EVENT.is_set() or request.cancelled.is_set() or request.disconnected():
                         return False
+                    if account_id and self.router:
+                        account = self.router.account(account_id)
+                        if not account or not account['enabled'] or account_id in self.router.unavailable:
+                            raise RoutingUnavailable('排队期间认证账号不可用，请重新提交请求')
                     if (not self.limit or self.active < self.limit) and self.next_ticket() is ticket:
                         self.remove_global_ticket(ticket)
                         self.active += 1
                         self.active_by_key[key_hash] = self.active_by_key.get(key_hash, 0) + 1
+                        self.tasks[ticket[0]]['stage'] = 'active'
+                        self.running[ticket[0]] = ticket
+                        if account_id:
+                            self.active_by_account[account_id] = self.active_by_account.get(account_id, 0) + 1
                         admitted = True
                         self.condition.notify_all()
                         return True
                     self.condition.wait(0.25)
             finally:
                 if not admitted:
+                    self.tasks.pop(ticket[0], None)
                     if ticket in self.global_waiting:
                         self.remove_global_ticket(ticket)
                     else:
@@ -591,16 +627,30 @@ class ConcurrencyQueue:
                     self.promote_waiters()
                     self.condition.notify_all()
 
-    def release(self, key_hash=''):
+    def release(self, key_hash='', request=None):
         with self.condition:
             if self.active <= 0 or self.active_by_key.get(key_hash, 0) <= 0:
                 raise RuntimeError('concurrency slot released without acquisition')
+            task_id = getattr(request, 'task_ticket', None) if request else next((i for i, t in self.running.items() if t[1] == key_hash), None)
+            if task_id is not None:
+                task = self.tasks.pop(task_id)
+                self.running.pop(task_id)
+                identity = task['account_id']
+                if identity:
+                    self.active_by_account[identity] -= 1
+                    if not self.active_by_account[identity]:
+                        del self.active_by_account[identity]
             self.active -= 1
             self.active_by_key[key_hash] -= 1
             if not self.active_by_key[key_hash]:
                 del self.active_by_key[key_hash]
             self.promote_waiters()
             self.condition.notify_all()
+
+    def detailed_snapshot(self):
+        with self.condition:
+            return {**self.snapshot(include_stages=True), 'timestamp': time.time(),
+                    'tasks': [dict(self.tasks[t[0]]) for t in list(self.running.values()) + list(self.global_waiting) + list(self.personal_waiting)]}
 
     def snapshot(self, include_stages=False):
         with self.condition:
@@ -653,6 +703,7 @@ def init_db():
     c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('last_keeper_usage_sync','0')")
     c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('global_concurrency',?)", (str(GLOBAL_CONCURRENCY),))
     c.close()
+    UPSTREAM_QUEUE.router = AccountRouter(db)
 
 def setting_get(key, default=""):
     c=db()
@@ -1104,7 +1155,7 @@ class Gateway(BaseHTTPRequestHandler):
                 user,password=base64.b64decode(auth.split(None,1)[1]).decode().split(':',1)
                 return user=='admin' and secrets.compare_digest(password,ADMIN_TOKEN)
             except Exception: return False
-        return False
+        return unified.session_admin(self, unified.namespace(globals()))
     def do_admin(self):
         if not self.admin_authenticated(): json_response(self,401,{'error':'admin authentication required'},{'WWW-Authenticate':'Basic realm="CPA Quota"'}); return True
         if self.command in ('POST','PUT','PATCH','DELETE') and self.headers.get('X-Quota-Admin-Request')!='1':
@@ -1112,6 +1163,7 @@ class Gateway(BaseHTTPRequestHandler):
         path=self.path.split('?',1)[0]
         if path in ('/admin','/admin/') and self.command=='GET':
             body=Path(__file__).with_name('admin.html').read_bytes(); self.send_response(200); self.send_header('Content-Type','text/html; charset=utf-8'); self.send_header('Content-Length',str(len(body))); self.send_header('Cache-Control','no-store'); self.end_headers(); self.wfile.write(body); return True
+        if unified.admin_route(self, unified.namespace(globals()), path): return True
         c=db()
         if path=='/admin/concurrency':
             if self.command=='GET':
@@ -1199,13 +1251,15 @@ class Gateway(BaseHTTPRequestHandler):
             c.execute('BEGIN IMMEDIATE'); hashes=[r['key_hash'] for r in c.execute('SELECT key_hash FROM policies WHERE keeper_active=1')]; reset=reset_policy_periods(c,hashes); c.commit(); c.close(); json_response(self,200,{'reset_count':len(reset),'reset_at':iso_time(now())}); return True
         c.close(); json_response(self,404,{'error':'not found'}); return True
     def dispatch(self):
-        if self.path.startswith('/admin/'): self.do_admin(); return
+        if unified.public_route(self, unified.namespace(globals())): return
+        if self.path == '/admin' or self.path.startswith('/admin/'): self.do_admin(); return
         if self.path.split('?',1)[0] in ('/v1/limit','/v1/usage'): self.do_user_query(); return
         self.proxy()
     def do_GET(self): self.dispatch()
     def do_POST(self): self.dispatch()
     def do_PUT(self): self.dispatch()
     def do_DELETE(self): self.dispatch()
+    def do_PATCH(self): self.dispatch()
     def do_user_query(self):
         if self.command!='GET': json_response(self,405,{'error':'method not allowed'},{'Allow':'GET'}); return
         key=self.auth_key()
@@ -1259,7 +1313,7 @@ class Gateway(BaseHTTPRequestHandler):
             except (ValueError, TypeError, json.JSONDecodeError): amount=RESERVATION
         c=db()
         try:
-            policy=c.execute('SELECT key_hash,enabled,concurrency,is_superuser FROM policies WHERE key_hash=? AND keeper_active=1',(key_hash(key),)).fetchone()
+            policy=c.execute('SELECT key_hash,alias,enabled,concurrency,is_superuser FROM policies WHERE key_hash=? AND keeper_active=1',(key_hash(key),)).fetchone()
         finally:
             c.close()
         if not policy:
@@ -1272,17 +1326,25 @@ class Gateway(BaseHTTPRequestHandler):
             self.reject_duplicate(track_state, fingerprint, attempts_used)
             return
         client_request = ClientRequest(getattr(self, 'connection', None))
+        client_request.alias = policy['alias']
+        client_request.model = model
+        client_request.route_account = bool(body)
+        client_request.session_hash = session_identity(self.headers, body)
         with ACTIVE_REQUESTS_LOCK:
             ACTIVE_REQUESTS[id(client_request)] = client_request
         admitted = False
         try:
+            if client_request.route_account:
+                unified.ensure_routing_ready(unified.namespace(globals()))
             admitted = UPSTREAM_QUEUE.acquire(client_request, policy['key_hash'], policy['concurrency'], policy['is_superuser'])
             if admitted:
                 self.proxy_admitted(key, body, model, amount, client_request, fingerprint, attempts_used)
+        except RoutingUnavailable as exc:
+            json_response(self,503,{'error':{'message':str(exc),'type':'server_error','code':'account_routing_unavailable'}})
         finally:
             REQUEST_ATTEMPTS.finish(fingerprint, explicit_request_id, completed=client_request.completed, failed=client_request.failed)
             if admitted:
-                UPSTREAM_QUEUE.release(policy['key_hash'])
+                UPSTREAM_QUEUE.release(policy['key_hash'], client_request)
             with ACTIVE_REQUESTS_LOCK:
                 ACTIVE_REQUESTS.pop(id(client_request), None)
 
@@ -1360,7 +1422,10 @@ class Gateway(BaseHTTPRequestHandler):
         response_bytes=0; stream_error=None
         try:
             target=urlsplit(UPSTREAM); path=self.path
-            hdr={k:v for k,v in self.headers.items() if k.lower() not in ('host','content-length','connection')}; hdr['Host']=target.netloc; hdr['Content-Length']=str(len(body)); hdr['X-Forwarded-For']=self.client_address[0]
+            hdr={k:v for k,v in self.headers.items() if k.lower() not in ('host','content-length','connection','x-quota-auth-id','x-quota-routing-token')}; hdr['Host']=target.netloc; hdr['Content-Length']=str(len(body)); hdr['X-Forwarded-For']=self.client_address[0]
+            if getattr(client_request, 'account_id', ''):
+                hdr['X-Quota-Auth-ID'] = client_request.account_id
+                hdr['X-Quota-Routing-Token'] = env('QUOTA_ROUTING_TOKEN')
             policy=upstream_retry_policy(len(body))
             deadline=(
                 None

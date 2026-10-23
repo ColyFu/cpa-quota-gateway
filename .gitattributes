@@ -1,0 +1,2 @@
+# Unified patches intentionally contain leading context spaces and blank context lines.
+integration-patches/*.patch -whitespace

@@ -1,0 +1,203 @@
+From 362d89a2e88c864af1aed754a5621bb08e1735af Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Fri, 23 Oct 2026 11:42:18 +0800
+Subject: [PATCH] Accept authenticated Gateway account pins before request
+ logging
+
+---
+ internal/api/server.go                 |  2 +
+ internal/api/server_routes.go          |  1 +
+ sdk/api/handlers/handlers.go           |  5 ++
+ sdk/api/handlers/quota_gateway.go      | 41 ++++++++++++
+ sdk/api/handlers/quota_gateway_test.go | 90 ++++++++++++++++++++++++++
+ 5 files changed, 139 insertions(+)
+ create mode 100644 sdk/api/handlers/quota_gateway.go
+ create mode 100644 sdk/api/handlers/quota_gateway_test.go
+
+diff --git a/internal/api/server.go b/internal/api/server.go
+index 454c255..909ca5c 100644
+--- a/internal/api/server.go
++++ b/internal/api/server.go
+@@ -145,6 +145,8 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
+ 	// Add middleware
+ 	engine.Use(logging.GinLogrusLogger())
+ 	engine.Use(logging.GinLogrusRecovery())
++	// Consume private routing credentials before any request logger copies headers.
++	engine.Use(handlers.QuotaGatewayRouting())
+ 	engine.Use(logging.CPATraceIDMiddleware())
+ 	for _, mw := range optionState.extraMiddleware {
+ 		engine.Use(mw)
+diff --git a/internal/api/server_routes.go b/internal/api/server_routes.go
+index 5c482f1..fe7f4a9 100644
+--- a/internal/api/server_routes.go
++++ b/internal/api/server_routes.go
+@@ -51,6 +51,7 @@ func (s *Server) setupRoutes() {
+ 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+ 	}
+ 	s.engine.GET("/healthz", healthzHandler)
++	s.engine.GET("/quota-gateway/capabilities", handlers.QuotaGatewayCapabilities)
+ 	s.engine.HEAD("/healthz", healthzHandler)
+ 
+ 	s.engine.GET("/management.html", s.serveManagementControlPanel)
+diff --git a/sdk/api/handlers/handlers.go b/sdk/api/handlers/handlers.go
+index 61604ee..d0beb67 100644
+--- a/sdk/api/handlers/handlers.go
++++ b/sdk/api/handlers/handlers.go
+@@ -502,6 +502,11 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
+ 		}
+ 	}
+ 	newCtx, cancel := context.WithCancel(parentCtx)
++	if c != nil {
++		if authID := c.GetString("quotaGatewayAuthID"); authID != "" {
++			newCtx = WithPinnedAuthID(newCtx, authID)
++		}
++	}
+ 
+ 	endpoint := ""
+ 	if c != nil && c.Request != nil {
+diff --git a/sdk/api/handlers/quota_gateway.go b/sdk/api/handlers/quota_gateway.go
+new file mode 100644
+index 0000000..9feb21c
+--- /dev/null
++++ b/sdk/api/handlers/quota_gateway.go
+@@ -0,0 +1,41 @@
++package handlers
++
++import (
++	"crypto/subtle"
++	"net/http"
++	"os"
++	"strings"
++
++	"github.com/gin-gonic/gin"
++)
++
++// QuotaGatewayRouting authenticates the optional credential pin before execution.
++// The normal API-key middleware still authenticates the request independently.
++func QuotaGatewayRouting() gin.HandlerFunc {
++	return func(c *gin.Context) {
++		id := strings.TrimSpace(c.GetHeader("X-Quota-Auth-ID"))
++		token := c.GetHeader("X-Quota-Routing-Token")
++		c.Request.Header.Del("X-Quota-Auth-ID")
++		c.Request.Header.Del("X-Quota-Routing-Token")
++		expected := os.Getenv("QUOTA_ROUTING_TOKEN")
++		verified := expected != "" && subtle.ConstantTimeCompare([]byte(token), []byte(expected)) == 1
++		c.Set("quotaGatewayAuthenticated", verified)
++		if id != "" {
++			if !verified {
++				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "invalid quota routing credential"})
++				return
++			}
++			c.Set("quotaGatewayAuthID", id)
++		}
++		c.Next()
++	}
++}
++
++// QuotaGatewayCapabilities lets the gateway fail closed against an unpatched CPA.
++func QuotaGatewayCapabilities(c *gin.Context) {
++	if !c.GetBool("quotaGatewayAuthenticated") {
++		c.AbortWithStatus(http.StatusForbidden)
++		return
++	}
++	c.JSON(http.StatusOK, gin.H{"credential_pinning": true, "version": 1})
++}
+diff --git a/sdk/api/handlers/quota_gateway_test.go b/sdk/api/handlers/quota_gateway_test.go
+new file mode 100644
+index 0000000..b0dc7b3
+--- /dev/null
++++ b/sdk/api/handlers/quota_gateway_test.go
+@@ -0,0 +1,90 @@
++package handlers
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	"github.com/gin-gonic/gin"
++	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
++	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
++	"golang.org/x/net/context"
++)
++
++func TestQuotaGatewayAuthenticatedPinReachesExecutorMetadata(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	t.Setenv("QUOTA_ROUTING_TOKEN", "server-secret")
++	for _, tc := range []struct {
++		name, token, id string
++		status          int
++	}{
++		{"normal", "", "", 200}, {"valid", "server-secret", "account-a", 200},
++		{"missing token", "", "account-a", 403}, {"forged token", "other", "account-a", 403},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			router := gin.New()
++			router.Use(QuotaGatewayRouting())
++			router.POST("/v1/responses", func(c *gin.Context) {
++				handler := &BaseAPIHandler{Cfg: &config.SDKConfig{}}
++				ctx, cancel := handler.GetContextWithCancel(nil, c, context.Background())
++				defer cancel()
++				got, _ := requestExecutionMetadata(ctx)[coreexecutor.PinnedAuthMetadataKey].(string)
++				if got != tc.id {
++					t.Errorf("pin = %q, want %q", got, tc.id)
++				}
++				if c.GetHeader("X-Quota-Auth-ID") != "" || c.GetHeader("X-Quota-Routing-Token") != "" {
++					t.Error("routing credentials leaked downstream")
++				}
++				c.Status(200)
++			})
++			req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
++			req.Header.Set("X-Quota-Auth-ID", tc.id)
++			req.Header.Set("X-Quota-Routing-Token", tc.token)
++			response := httptest.NewRecorder()
++			router.ServeHTTP(response, req)
++			if response.Code != tc.status {
++				t.Fatalf("status = %d, want %d", response.Code, tc.status)
++			}
++		})
++	}
++}
++
++func TestQuotaGatewayDisabledRejectsPins(t *testing.T) {
++	t.Setenv("QUOTA_ROUTING_TOKEN", "")
++	router := gin.New()
++	router.Use(QuotaGatewayRouting())
++	router.GET("/v1/models", func(c *gin.Context) { c.Status(200) })
++	req := httptest.NewRequest("GET", "/v1/models", nil)
++	req.Header.Set("X-Quota-Auth-ID", "a")
++	response := httptest.NewRecorder()
++	router.ServeHTTP(response, req)
++	if response.Code != 403 {
++		t.Fatalf("status=%d", response.Code)
++	}
++}
++
++func TestQuotaGatewayCapabilityRequiresSecretAndDoesNotExposeIt(t *testing.T) {
++	t.Setenv("QUOTA_ROUTING_TOKEN", "secret")
++	router := gin.New()
++	router.Use(QuotaGatewayRouting())
++	router.Use(func(c *gin.Context) {
++		if c.GetHeader("X-Quota-Routing-Token") != "" {
++			t.Error("token reached later middleware")
++		}
++		c.Next()
++	})
++	router.GET("/quota-gateway/capabilities", QuotaGatewayCapabilities)
++	for _, token := range []string{"", "wrong", "secret"} {
++		req := httptest.NewRequest("GET", "/quota-gateway/capabilities", nil)
++		req.Header.Set("X-Quota-Routing-Token", token)
++		response := httptest.NewRecorder()
++		router.ServeHTTP(response, req)
++		expected := 403
++		if token == "secret" {
++			expected = 200
++		}
++		if response.Code != expected {
++			t.Errorf("status=%d, want %d", response.Code, expected)
++		}
++	}
++}
+-- 
+2.43.0
+

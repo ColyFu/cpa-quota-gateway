@@ -1,0 +1,1056 @@
+From 1c2ac07b853388d553c99da22d39db1b4882c4d2 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Fri, 23 Oct 2026 11:42:18 +0800
+Subject: [PATCH] Merge Gateway quotas, live queues and account settings into
+ Keeper console
+
+---
+ internal/api/router.go                        |  12 +-
+ internal/app/app.go                           |  37 ++-
+ internal/app/test/gateway_integration_test.go |  32 ++
+ web/index.html                                |   2 +-
+ web/src/components/BrandLink.tsx              |   5 +-
+ .../components/usage/ApiKeySettingsCard.tsx   |   9 +-
+ web/src/features/gateway/AccountRouting.tsx   |  43 +++
+ .../features/gateway/LocalRankingPanel.tsx    |  16 +
+ web/src/features/gateway/QueuePools.test.tsx  |  41 +++
+ web/src/features/gateway/QueuePools.tsx       |  45 +++
+ .../features/gateway/UserQuotaSettings.tsx    |  70 +++++
+ web/src/features/gateway/api.ts               |  11 +
+ web/src/features/gateway/gateway.css          |   3 +
+ web/src/i18n/index.ts                         |   6 +-
+ web/src/pages/UsagePage.tsx                   | 296 ++----------------
+ 15 files changed, 325 insertions(+), 303 deletions(-)
+ create mode 100644 internal/app/test/gateway_integration_test.go
+ create mode 100644 web/src/features/gateway/AccountRouting.tsx
+ create mode 100644 web/src/features/gateway/LocalRankingPanel.tsx
+ create mode 100644 web/src/features/gateway/QueuePools.test.tsx
+ create mode 100644 web/src/features/gateway/QueuePools.tsx
+ create mode 100644 web/src/features/gateway/UserQuotaSettings.tsx
+ create mode 100644 web/src/features/gateway/api.ts
+ create mode 100644 web/src/features/gateway/gateway.css
+
+diff --git a/internal/api/router.go b/internal/api/router.go
+index 45ae622..5b6b92b 100644
+--- a/internal/api/router.go
++++ b/internal/api/router.go
+@@ -122,18 +122,22 @@ func NewRouter(
+ 	adminProtected := apiV1.Group("")
+ 	adminProtected.Use(authHandler.adminMiddleware())
+ 	registerStatusRoutes(adminProtected, statusProvider, statusConfig)
+-	registerUpdateRoutes(adminProtected, nil)
++	if os.Getenv("QUOTA_GATEWAY_INTEGRATION") != "1" {
++		registerUpdateRoutes(adminProtected, nil)
++	}
+ 	registerUsageOverviewRoute(adminProtected, usageProvider, cpaAPIKeyProvider)
+ 	registerUsageActivityRoute(adminProtected, usageProvider)
+ 	registerUsageAnalysisRoute(adminProtected, usageProvider, cpaAPIKeyProvider)
+ 	registerUsageEventsRoute(adminProtected, usageProvider, usageIdentityProvider, cpaAPIKeyProvider, requestLogProvider, requestLogDownloadTokens, statusConfig.CPARequestLogAccessEnabled)
+ 	registerUsageIdentityRoutes(adminProtected, usageIdentityProvider)
+ 	registerAuthFileManagementRoutes(adminProtected, authFilesProvider)
+-	registerAuthSessionManagementRoutes(adminProtected, authHandler)
++	if os.Getenv("QUOTA_GATEWAY_INTEGRATION") != "1" {
++		registerAuthSessionManagementRoutes(adminProtected, authHandler)
++	}
+ 	registerCPAAPIKeyRoutes(adminProtected, cpaAPIKeyProvider)
+ 	registerPricingRoutes(adminProtected, pricingProvider)
+ 	registerQuotaRoutes(adminProtected, quotaProvider)
+-	if rankingProvider != nil {
++	if rankingProvider != nil && os.Getenv("QUOTA_GATEWAY_INTEGRATION") != "1" {
+ 		rankinghttpapi.RegisterRoutes(adminProtected, rankingProvider)
+ 	}
+ 	if localRankingProvider != nil {
+@@ -327,7 +331,7 @@ func registerVersionRoutes(router gin.IRoutes) {
+ func buildVersionResponse() versionResponse {
+ 	return versionResponse{
+ 		Version:            version.Version,
+-		UpdateCheckEnabled: updatecheck.IsStableVersion(version.Version),
++		UpdateCheckEnabled: os.Getenv("QUOTA_GATEWAY_INTEGRATION") != "1" && updatecheck.IsStableVersion(version.Version),
+ 	}
+ }
+ 
+diff --git a/internal/app/app.go b/internal/app/app.go
+index 264fb1f..5a78b44 100644
+--- a/internal/app/app.go
++++ b/internal/app/app.go
+@@ -6,6 +6,7 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"net/url"
++	"os"
+ 	"strings"
+ 	"sync"
+ 	"time"
+@@ -133,24 +134,28 @@ func NewWithConfig(cfg config.Config) (*App, error) {
+ 	if err != nil {
+ 		return nil, failInitialization(logCloser, err)
+ 	}
+-	// Ranking 完全复用现有 app_settings 和统一 DB；构造阶段不访问中心，默认 disabled 没有外部请求。
+-	rankingService, err := ranking.NewService(ranking.NewStore(db), ranking.NewAggregator(db), ranking.NewClient())
+-	if err != nil {
+-		if readDB != db {
+-			_ = closeGormDB(readDB)
++	var rankingService *ranking.Service
++	var rankingRunner Runner
++	if os.Getenv("QUOTA_GATEWAY_INTEGRATION") != "1" {
++		// Ranking 完全复用现有 app_settings 和统一 DB；构造阶段不访问中心，默认 disabled 没有外部请求。
++		rankingService, err = ranking.NewService(ranking.NewStore(db), ranking.NewAggregator(db), ranking.NewClient())
++		if err != nil {
++			if readDB != db {
++				_ = closeGormDB(readDB)
++			}
++			_ = closeGormDB(db)
++			_ = logCloser.Close()
++			return nil, err
+ 		}
+-		_ = closeGormDB(db)
+-		_ = logCloser.Close()
+-		return nil, err
+-	}
+-	rankingRunner, err := ranking.NewRunner(rankingService)
+-	if err != nil {
+-		if readDB != db {
+-			_ = closeGormDB(readDB)
++		rankingRunner, err = ranking.NewRunner(rankingService)
++		if err != nil {
++			if readDB != db {
++				_ = closeGormDB(readDB)
++			}
++			_ = closeGormDB(db)
++			_ = logCloser.Close()
++			return nil, err
+ 		}
+-		_ = closeGormDB(db)
+-		_ = logCloser.Close()
+-		return nil, err
+ 	}
+ 	// 最近事件缓存继续使用统一 DB；其 Query 会由 dbresolver 自动路由到 reader。
+ 	recentUsageCache, err := newUsageRecentEventCache(db, repository.UsageRecentEventCacheOptions{})
+diff --git a/internal/app/test/gateway_integration_test.go b/internal/app/test/gateway_integration_test.go
+new file mode 100644
+index 0000000..af9e845
+--- /dev/null
++++ b/internal/app/test/gateway_integration_test.go
+@@ -0,0 +1,32 @@
++package test
++
++import (
++	keeperapp "cpa-usage-keeper/internal/app"
++	"cpa-usage-keeper/internal/config"
++	"path/filepath"
++	"testing"
++	"time"
++)
++
++func TestGatewayIntegrationKeepsLocalRankingWithoutCommunityRunner(t *testing.T) {
++	t.Setenv("QUOTA_GATEWAY_INTEGRATION", "1")
++	cfg := config.Config{AppPort: "invalid-port", CPABaseURL: "http://127.0.0.1:1", CPAManagementKey: "test",
++		RedisQueueIdleInterval: time.Second, MetadataSyncInterval: 30 * time.Second,
++		SQLitePath: filepath.Join(t.TempDir(), "integration.db"), RequestTimeout: time.Second, LogLevel: "error", LogFileEnabled: false}
++	application, err := keeperapp.NewWithConfig(cfg)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer application.Close()
++	if application.Ranking != nil {
++		t.Fatal("community ranking must not start in integrated mode")
++	}
++	if application.LocalRanking == nil {
++		t.Fatal("local ranking must remain available")
++	}
++	for _, route := range application.Router.Routes() {
++		if route.Path == "/api/v1/auth/sessions" || route.Path == "/api/v1/update/check" || route.Path == "/api/v1/ranking/status" {
++			t.Fatalf("removed route remains: %s", route.Path)
++		}
++	}
++}
+diff --git a/web/index.html b/web/index.html
+index 8ee8e52..92abac1 100644
+--- a/web/index.html
++++ b/web/index.html
+@@ -3,7 +3,7 @@
+   <head>
+     <meta charset="UTF-8" />
+     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+-    <title>KEEPER</title>
++    <title>CPA Quota Gateway</title>
+     <script>
+       window.__APP_BASE_PATH__ = "__APP_BASE_PATH__";
+     </script>
+diff --git a/web/src/components/BrandLink.tsx b/web/src/components/BrandLink.tsx
+index 8889282..86611a7 100644
+--- a/web/src/components/BrandLink.tsx
++++ b/web/src/components/BrandLink.tsx
+@@ -1,4 +1,3 @@
+-import { GITHUB_REPOSITORY_URL } from '@/utils/constants';
+ import keeperIconUrl from '@/assets/keeper-icon.svg';
+ import styles from './BrandLink.module.scss';
+ 
+@@ -10,9 +9,9 @@ export function BrandLink({ className = '' }: BrandLinkProps) {
+   const linkClassName = `${styles.brandLink} ${className}`.trim();
+ 
+   return (
+-    <a className={linkClassName} href={GITHUB_REPOSITORY_URL} target="_blank" rel="noreferrer">
++    <a className={linkClassName} href="/">
+       <img className={styles.brandMark} src={keeperIconUrl} alt="" aria-hidden="true" />
+-      <span className={styles.brandWord}>KEEPER</span>
++      <span className={styles.brandWord}>CPA Quota Gateway</span>
+     </a>
+   );
+ }
+diff --git a/web/src/components/usage/ApiKeySettingsCard.tsx b/web/src/components/usage/ApiKeySettingsCard.tsx
+index 391f250..a1a9d55 100644
+--- a/web/src/components/usage/ApiKeySettingsCard.tsx
++++ b/web/src/components/usage/ApiKeySettingsCard.tsx
+@@ -1,4 +1,4 @@
+-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
++import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { Card } from '@/components/ui/Card';
+ import { Button } from '@/components/ui/Button';
+@@ -84,6 +84,8 @@ export async function copyApiKeyToClipboard(apiKey: string, context: CopyContext
+ }
+ 
+ export interface ApiKeySettingsCardProps {
++  title?: string;
++  renderPolicy?: (item: CpaApiKeySettingsItem) => ReactNode;
+   apiKeys: CpaApiKeySettingsItem[];
+   loading?: boolean;
+   savingId?: string | null;
+@@ -91,7 +93,7 @@ export interface ApiKeySettingsCardProps {
+   onNotice?: (kind: 'success' | 'info' | 'error', message: string) => void;
+ }
+ 
+-export function ApiKeySettingsCard({ apiKeys, loading = false, savingId = null, onSaveAlias, onNotice }: ApiKeySettingsCardProps) {
++export function ApiKeySettingsCard({ title, renderPolicy, apiKeys, loading = false, savingId = null, onSaveAlias, onNotice }: ApiKeySettingsCardProps) {
+   const { t } = useTranslation();
+   const [showFullApiKeys, setShowFullApiKeys] = useState(false);
+   const [copiedId, setCopiedId] = useState<string | null>(null);
+@@ -134,7 +136,7 @@ export function ApiKeySettingsCard({ apiKeys, loading = false, savingId = null,
+ 
+   return (
+     <Card
+-      title={t('usage_stats.api_key_settings_title')}
++      title={title ?? t('usage_stats.api_key_settings_title')}
+       subtitle={t('usage_stats.api_key_settings_subtitle')}
+       titleMeta={
+         <Button
+@@ -205,6 +207,7 @@ export function ApiKeySettingsCard({ apiKeys, loading = false, savingId = null,
+                       </Button>
+                     </div>
+                   </div>
++                  {renderPolicy?.(item)}
+                 </div>
+               );
+             })}
+diff --git a/web/src/features/gateway/AccountRouting.tsx b/web/src/features/gateway/AccountRouting.tsx
+new file mode 100644
+index 0000000..0f88168
+--- /dev/null
++++ b/web/src/features/gateway/AccountRouting.tsx
+@@ -0,0 +1,43 @@
++import { useEffect, useState } from 'react';
++import { gatewayAPI, type Routing } from './api';
++import './gateway.css';
++interface Discovered { id: string; name: string; provider: string; available: boolean }
++export function AccountRouting() {
++  const [config, setConfig] = useState<Routing | null>(null);
++  const [limit, setLimit] = useState(0);
++  const [discovered, setDiscovered] = useState<Discovered[]>([]);
++  const [message, setMessage] = useState('');
++  const [busy, setBusy] = useState(false);
++  useEffect(() => {
++    const controller = new AbortController();
++    void Promise.all([gatewayAPI<Routing>('routing', 'GET', undefined, controller.signal), gatewayAPI<{ limit: number }>('concurrency', 'GET', undefined, controller.signal)]).then(([routing, state]) => { setConfig(routing); setLimit(state.limit); }).catch(e => { if (!controller.signal.aborted) setMessage(e.message); });
++    void gatewayAPI<{ accounts: Discovered[] }>('accounts', 'GET', undefined, controller.signal).then(d => setDiscovered(d.accounts)).catch(e => { if (!controller.signal.aborted) setMessage(e.message); });
++    return () => controller.abort();
++  }, []);
++  const save = async (event: React.FormEvent) => {
++    event.preventDefault(); if (!config) return; setBusy(true); setMessage('');
++    try { const saved = await gatewayAPI<Routing>('routing', 'PUT', config); setConfig(saved); setMessage('账号调度设置已保存'); }
++    catch (e) { setMessage(e instanceof Error ? e.message : '保存失败'); } finally { setBusy(false); }
++  };
++  return <section className="gw-card"><div className="gw-heading"><div><h2>并发与账号调度</h2><p>总并发控制整个网关；账号并发控制单个认证文件。</p></div></div>
++    {message && <p role="status" className="gw-message">{message}</p>}
++    <form className="gw-inline" onSubmit={async e => { e.preventDefault(); setBusy(true); try { await gatewayAPI('concurrency', 'PUT', { global_limit: limit }); setMessage('总并发已保存'); } catch(e) { setMessage((e as Error).message); } finally { setBusy(false); } }}>
++      <label>总并发上限<input type="number" min="0" step="1" required value={limit} onChange={e => setLimit(Number(e.target.value))} /></label><button disabled={busy || !config}>保存总并发</button><span>0 表示不限制</span>
++    </form>
++    {config && <form onSubmit={save}>
++      <div className="gw-inline">
++        <label className="gw-check"><input type="checkbox" checked={config.enabled} onChange={e => setConfig({ ...config, enabled: e.target.checked })} />启用账号调度</label>
++        <label>会话保持（小时）<input type="number" min="0.1" max="720" step="0.1" required value={config.session_ttl_hours} onChange={e => setConfig({ ...config, session_ttl_hours: Number(e.target.value) })} /></label>
++        <label>账号溢出阈值（排队数）<input type="number" min="0" step="1" required value={config.overflow_threshold} onChange={e => setConfig({ ...config, overflow_threshold: Number(e.target.value) })} /></label>
++      </div>
++      <p className="gw-help">同一用户的同一 session 从最近一次请求起保持绑定。新会话优先使用用户指定账号；账号满载且排队达到阈值时，才分配到有空位的账号。已有会话保持原账号，账号不可用时重新选择。</p>
++      <div className="gw-table-wrap"><table className="gw-table"><thead><tr><th>认证文件</th><th>参与调度</th><th>账号并发</th><th>模型限制（留空由 CPA 判断）</th></tr></thead><tbody>{config.accounts.map((account, index) => <tr key={account.id}>
++        <td><strong>{account.name}</strong><small>{account.id}</small></td>
++        <td><input aria-label={`${account.name} 参与调度`} type="checkbox" checked={account.enabled} onChange={e => setConfig({ ...config, accounts: config.accounts.map((a, i) => i === index ? { ...a, enabled: e.target.checked } : a) })} /></td>
++        <td><input aria-label={`${account.name} 账号并发`} type="number" min="1" step="1" required value={account.concurrency} onChange={e => setConfig({ ...config, accounts: config.accounts.map((a, i) => i === index ? { ...a, concurrency: Number(e.target.value) } : a) })} /></td>
++        <td><input aria-label={`${account.name} 模型限制`} defaultValue={account.models.join(', ')} onBlur={e => setConfig({ ...config, accounts: config.accounts.map((a, i) => i === index ? { ...a, models: e.target.value.split(',').map(x => x.trim()).filter(Boolean) } : a) })} /></td>
++      </tr>)}</tbody></table></div>
++      <div className="gw-inline"><label>添加认证文件<select value="" onChange={e => { const a = discovered.find(x => x.id === e.target.value); if (a) setConfig({ ...config, accounts: [...config.accounts, { id: a.id, name: a.name, enabled: a.available, concurrency: 1, models: [] }] }); }}><option value="">请选择账号</option>{discovered.filter(a => !config.accounts.some(c => c.id === a.id)).map(a => <option key={a.id} value={a.id}>{a.name} · {a.provider}{a.available ? '' : '（不可用）'}</option>)}</select></label><button disabled={busy}>保存账号调度</button></div>
++    </form>}
++  </section>;
++}
+diff --git a/web/src/features/gateway/LocalRankingPanel.tsx b/web/src/features/gateway/LocalRankingPanel.tsx
+new file mode 100644
+index 0000000..2eed54d
+--- /dev/null
++++ b/web/src/features/gateway/LocalRankingPanel.tsx
+@@ -0,0 +1,16 @@
++import { useState } from 'react';
++import { RankingPage } from '@/features/ranking/RankingPage';
++import { useLocalRankingData } from '@/features/ranking/hooks/useLocalRankingData';
++import type { RankingMetric, RankingPeriod } from '@/features/ranking/types';
++const noop = async () => null;
++export function LocalRankingPanel({ onAuthRequired }: { onAuthRequired?: () => void }) {
++  const [period, setPeriod] = useState<RankingPeriod>('today');
++  const [metric, setMetric] = useState<RankingMetric>('overall');
++  const data = useLocalRankingData({ enabled: true, period, metric, onAuthRequired });
++  return <section aria-label="本地排名"><h2 style={{fontSize:18, marginBottom:16}}>本地排名</h2><RankingPage scope="local" period={period} metric={metric} status={null} metadata={null}
++    leaderboard={data.leaderboard} leaderboardLoading={data.leaderboardLoading} leaderboardError={data.leaderboardError}
++    statusLoading={false} metadataLoading={false} statusError={null} metadataError={null} action={null} actionError={null}
++    onClearActionError={() => {}} onJoin={noop} onSync={noop} onPause={noop} onResume={noop} onExit={noop}
++    onRetryStatus={noop} onRetryMetadata={noop} onRetryLeaderboard={data.refreshLeaderboard}
++    onUpdateLocalProfile={data.updateProfile} onPeriodChange={setPeriod} onMetricChange={setMetric} /></section>;
++}
+diff --git a/web/src/features/gateway/QueuePools.test.tsx b/web/src/features/gateway/QueuePools.test.tsx
+new file mode 100644
+index 0000000..5cfe04b
+--- /dev/null
++++ b/web/src/features/gateway/QueuePools.test.tsx
+@@ -0,0 +1,41 @@
++// @vitest-environment happy-dom
++import { act } from 'react';
++import { createRoot, type Root } from 'react-dom/client';
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
++import { QueuePools, userHue } from './QueuePools';
++import { gatewayAPI } from './api';
++vi.mock('./api', () => ({ gatewayAPI: vi.fn() }));
++globalThis.IS_REACT_ACT_ENVIRONMENT = true;
++const task = { id: 'one', key_hash: 'abc', name: '小林', model: 'model-a', stage: 'personal', created_at: 10, account_id: 'account-a' };
++const state = { timestamp: 20, limit: 1, active: 0, global_queued: 0, personal_queued: 1, tasks: [task] };
++describe('live queue pools', () => {
++  let container: HTMLDivElement; let root: Root;
++  beforeEach(() => { vi.useFakeTimers(); vi.mocked(gatewayAPI).mockReset(); container = document.createElement('div'); document.body.appendChild(container); root = createRoot(container); });
++  afterEach(async () => { await act(async () => root.unmount()); container.remove(); vi.useRealTimers(); });
++  it('moves a named task between pools while retaining its user color', async () => {
++    vi.mocked(gatewayAPI).mockResolvedValueOnce(state).mockResolvedValueOnce({ ...state, timestamp: 21, active: 1, personal_queued: 0, tasks: [{ ...task, stage: 'active' }] });
++    await act(async () => root.render(<QueuePools />));
++    expect(container.querySelector('.gw-pool-personal .gw-ball')?.textContent).toBe('小林');
++    const hue = container.querySelector('.gw-ball')?.getAttribute('style');
++    await act(async () => vi.advanceTimersByTimeAsync(1000));
++    expect(container.querySelector('.gw-pool-personal .gw-ball')).toBeNull();
++    expect(container.querySelector('.gw-pool-active .gw-ball')?.getAttribute('style')).toBe(hue);
++    expect(container.querySelectorAll('.gw-pool')).toHaveLength(3);
++    expect(userHue('abc')).not.toBe(userHue('xyz'));
++  });
++  it('keeps the last snapshot visible and labels it stale after a failed poll', async () => {
++    vi.mocked(gatewayAPI).mockResolvedValueOnce(state).mockRejectedValueOnce(new Error('离线'));
++    await act(async () => root.render(<QueuePools />));
++    await act(async () => vi.advanceTimersByTimeAsync(1000));
++    expect(container.querySelector('.gw-ball')?.textContent).toBe('小林');
++    expect(container.querySelector('[role=alert]')?.textContent).toContain('最后一次');
++    expect(container.querySelector('.gw-status')?.textContent).toContain('离线');
++  });
++  it('aborts the in-flight fetch when leaving request events', async () => {
++    vi.mocked(gatewayAPI).mockImplementation(() => new Promise(() => {}));
++    await act(async () => root.render(<QueuePools />));
++    const signal = vi.mocked(gatewayAPI).mock.calls[0][3];
++    await act(async () => root.render(<div />));
++    expect(signal?.aborted).toBe(true);
++  });
++});
+diff --git a/web/src/features/gateway/QueuePools.tsx b/web/src/features/gateway/QueuePools.tsx
+new file mode 100644
+index 0000000..fc341a7
+--- /dev/null
++++ b/web/src/features/gateway/QueuePools.tsx
+@@ -0,0 +1,45 @@
++import { useEffect, useState, type CSSProperties } from 'react';
++import { gatewayAPI } from './api';
++import './gateway.css';
++interface Task { id: string; key_hash: string; name: string; model: string; stage: 'active' | 'global' | 'personal'; created_at: number; account_id: string }
++interface Queue { timestamp: number; limit: number; active: number; global_queued: number; personal_queued: number; tasks: Task[] }
++export const userHue = (key: string) => Array.from(key).reduce((sum, ch) => (sum * 31 + ch.charCodeAt(0)) >>> 0, 0) % 360;
++export function QueuePools() {
++  const [queue, setQueue] = useState<Queue | null>(null);
++  const [error, setError] = useState('');
++  const [user, setUser] = useState('');
++  useEffect(() => {
++    const controller = new AbortController(); let timer: ReturnType<typeof setTimeout>;
++    const poll = async () => {
++      if (!document.hidden) {
++        try { setQueue(await gatewayAPI<Queue>('queue', 'GET', undefined, controller.signal)); setError(''); }
++        catch (e) { if (!controller.signal.aborted) setError(e instanceof Error ? e.message : '更新失败'); }
++      }
++      if (!controller.signal.aborted) timer = setTimeout(poll, 1000);
++    };
++    void poll(); return () => { controller.abort(); clearTimeout(timer); };
++  }, []);
++  const users = Array.from(new Map(queue?.tasks.map(task => [task.key_hash, task.name]) ?? []).entries());
++  const stages = [['active', '执行中', '已获得执行名额'], ['global', '总排队', '等待总名额或目标账号'], ['personal', '个人排队', '等待个人并发名额']] as const;
++  return <section className="gw-card" aria-label="实时请求队列">
++    <div className="gw-heading"><div><h2>实时请求队列</h2><p>每个小球代表一个请求，同一用户使用同一颜色。</p></div>
++      <span className={error ? 'gw-status gw-error' : 'gw-status'} role="status">{error ? `连接中断 · ${error}` : queue ? `实时更新 · ${new Date(queue.timestamp * 1000).toLocaleTimeString()}` : '正在连接…'}</span></div>
++    {error && <p role="alert">显示的是最后一次成功读取的状态。</p>}
++    <div className="gw-pools">{stages.map(([stage, title, subtitle]) => {
++      const tasks = queue?.tasks.filter(t => t.stage === stage && (stage !== 'personal' || !user || t.key_hash === user)) ?? [];
++      const count = stage === 'active' ? queue?.active : stage === 'global' ? queue?.global_queued : (user ? tasks.length : queue?.personal_queued);
++      return <div className={`gw-pool gw-pool-${stage}`} key={stage}>
++        <div className="gw-pool-title"><h3>{title}</h3><strong>{count ?? '—'}{stage === 'active' && queue ? <small> / {queue.limit || '不限'}</small> : null}</strong></div>
++        <p>{subtitle}</p>
++        {stage === 'personal' && <select aria-label="个人排队用户" value={user} onChange={e => setUser(e.target.value)}><option value="">全部用户</option>{users.map(([id, name]) => <option key={id} value={id}>{name}</option>)}</select>}
++        <div className="gw-balls" aria-label={`${title}的任务`}>
++          {tasks.map(task => <div key={task.id} className="gw-ball" style={{ '--user-hue': userHue(task.key_hash) } as CSSProperties}
++            title={`${task.name}\n${task.model}\n目标账号：${task.account_id || '自动'}\n已等待/执行 ${Math.max(0, Math.round((queue?.timestamp ?? 0) - task.created_at))} 秒\n请求 ${task.id}`} tabIndex={0}>
++            <span>{task.name}</span></div>)}
++          {queue && !tasks.length && <span className="gw-pool-empty">{stage === 'active' ? '当前没有执行中的请求' : '当前没有排队请求'}</span>}
++        </div>
++      </div>;
++    })}</div>
++    <div className="gw-legend">{users.map(([id, name]) => <span key={id}><i style={{ background: `hsl(${userHue(id)} 65% 48%)` }} />{name}</span>)}</div>
++  </section>;
++}
+diff --git a/web/src/features/gateway/UserQuotaSettings.tsx b/web/src/features/gateway/UserQuotaSettings.tsx
+new file mode 100644
+index 0000000..066953a
+--- /dev/null
++++ b/web/src/features/gateway/UserQuotaSettings.tsx
+@@ -0,0 +1,70 @@
++import { useEffect, useState } from 'react';
++import { ApiKeySettingsCard, type ApiKeySettingsCardProps } from '@/components/usage/ApiKeySettingsCard';
++import { gatewayAPI, type Policy, type Routing } from './api';
++import './gateway.css';
++function PolicyForm({ initial, routing, onSaved }: { initial: Policy; routing: Routing; onSaved: () => void }) {
++  const [draft, setDraft] = useState(initial);
++  const [preferred, setPreferred] = useState(routing.preferences[initial.key_hash]?.[0] ?? '');
++  const [busy, setBusy] = useState(false); const [message, setMessage] = useState('');
++  const save = async (e: React.FormEvent) => {
++    e.preventDefault(); setBusy(true); setMessage('');
++    try {
++      const saved = await gatewayAPI<Policy>('policy', 'PUT', { key_hash: draft.key_hash, limit_usd: draft.limit_usd, rpm: draft.rpm, concurrency: draft.concurrency, enabled: draft.enabled, is_superuser: draft.is_superuser, cycle_type: draft.cycle_type, cycle_days: draft.cycle_days });
++      setDraft(saved);
++      try { await gatewayAPI('preference', 'PUT', { key_hash: draft.key_hash, accounts: preferred ? [preferred] : [] }); }
++      catch (e) { setMessage(`额度已保存，优先账号保存失败：${(e as Error).message}`); return; }
++      setMessage('用户额度与优先账号已保存'); onSaved();
++    } catch (e) { setMessage((e as Error).message); } finally { setBusy(false); }
++  };
++  return <form className="gw-policy" onSubmit={save}>
++    <div className="gw-usage"><span>周期已用 <strong>${draft.used_usd.toFixed(2)}</strong></span><span>剩余 ${draft.remaining_usd.toFixed(2)}</span><progress max={Math.max(draft.limit_usd, 1)} value={draft.used_usd} /><span>周期截止 {draft.period_ends_at ? new Date(draft.period_ends_at).toLocaleString() : '—'}</span></div>
++    <div className="gw-policy-fields">
++      <label>周期额度（USD）<input type="number" min="0" step="0.01" required value={draft.limit_usd} onChange={e => setDraft({ ...draft, limit_usd: Number(e.target.value) })} /></label>
++      <label>计费周期<select value={draft.cycle_type} onChange={e => setDraft({ ...draft, cycle_type: e.target.value })}><option value="calendar_month">自然月</option><option value="fixed_days">自定义天数</option></select></label>
++      {draft.cycle_type === 'fixed_days' && <label>天数<input type="number" min="1" max="3650" step="1" required value={draft.cycle_days} onChange={e => setDraft({ ...draft, cycle_days: Number(e.target.value) })} /></label>}
++      <label>RPM（0 不限）<input type="number" min="0" step="1" required value={draft.rpm} onChange={e => setDraft({ ...draft, rpm: Number(e.target.value) })} /></label>
++      <label>个人并发（0 不限）<input type="number" min="0" step="1" required value={draft.concurrency} onChange={e => setDraft({ ...draft, concurrency: Number(e.target.value) })} /></label>
++      <label>优先认证账号<select value={preferred} onChange={e => setPreferred(e.target.value)}><option value="">自动分配</option>{routing.accounts.map(a => <option value={a.id} key={a.id}>{a.name}{a.enabled ? '' : '（停用）'}</option>)}</select></label>
++      <label className="gw-check"><input type="checkbox" checked={draft.enabled} onChange={e => setDraft({ ...draft, enabled: e.target.checked })} />启用 Key</label>
++      <label className="gw-check"><input type="checkbox" checked={draft.is_superuser} onChange={e => setDraft({ ...draft, is_superuser: e.target.checked })} />超级用户</label>
++      <button disabled={busy}>保存额度与账号</button><button type="button" disabled={busy} onClick={async () => {
++        if (!window.confirm(`重置 ${draft.alias || '此用户'} 的额度并开始新周期？历史流水将保留。`)) return;
++        setBusy(true); try { setDraft(await gatewayAPI<Policy>('policy/reset', 'POST', { key_hash: draft.key_hash })); setMessage('额度已重置'); onSaved(); } catch(e) { setMessage((e as Error).message); } finally { setBusy(false); }
++      }}>重置额度</button>
++    </div>{message && <p role="status">{message}</p>}
++  </form>;
++}
++export function UserQuotaSettings(props: ApiKeySettingsCardProps & { onSyncKeys?: () => Promise<void> }) {
++  const [policies, setPolicies] = useState<Record<string, Policy>>({});
++  const [links, setLinks] = useState<Record<string, string>>({});
++  const [routing, setRouting] = useState<Routing | null>(null);
++  const [message, setMessage] = useState('');
++  const [search, setSearch] = useState('');
++  const [sort, setSort] = useState(false);
++  const [revision, setRevision] = useState(0);
++  const [busy, setBusy] = useState(false);
++  const bulk = async (action: 'enable' | 'disable' | 'reset') => {
++    const label = action === 'enable' ? '启用全部 Key' : action === 'disable' ? '停用全部 Key' : '重置全部用户额度';
++    if (!window.confirm(`${label}？此操作包含搜索结果之外的全部用户。`)) return;
++    setBusy(true);
++    try {
++      await gatewayAPI(action === 'reset' ? 'reset-all' : 'policies/enabled', action === 'reset' ? 'POST' : 'PUT', action === 'reset' ? undefined : { enabled: action === 'enable' });
++      setMessage(`${label}成功`); setRevision(value => value + 1);
++    } catch (e) { setMessage((e as Error).message); } finally { setBusy(false); }
++  };
++  useEffect(() => {
++    const controller = new AbortController();
++    void Promise.all([gatewayAPI<{items: Policy[]}>('summary', 'GET', undefined, controller.signal), gatewayAPI<{ items: { id: string; key_hash: string }[] }>('key-links', 'GET', undefined, controller.signal), gatewayAPI<Routing>('routing', 'GET', undefined, controller.signal)])
++      .then(([summary, keys, config]) => { setPolicies(Object.fromEntries(summary.items.map(p => [p.key_hash, p]))); setLinks(Object.fromEntries(keys.items.map(k => [k.id, k.key_hash]))); setRouting(config); })
++      .catch(e => { if (!controller.signal.aborted) setMessage(e.message); });
++    return () => controller.abort();
++  }, [revision]);
++  const users = props.apiKeys.filter(k => `${k.keyAlias} ${k.displayKey}`.toLowerCase().includes(search.toLowerCase())).sort((a,b) => sort ? (policies[links[b.id]]?.used_usd ?? 0) - (policies[links[a.id]]?.used_usd ?? 0) : 0);
++  return <div className="gw-users"><div className="gw-inline"><input aria-label="搜索用户" placeholder="搜索用户 / API Key" value={search} onChange={e => setSearch(e.target.value)} /><label className="gw-check"><input type="checkbox" checked={sort} onChange={e => setSort(e.target.checked)} />按用量排序</label><button disabled={busy} onClick={() => void bulk('enable')}>启用全部 Key</button><button disabled={busy} onClick={() => void bulk('disable')}>停用全部 Key</button><button disabled={busy} onClick={() => void bulk('reset')}>重置全部额度</button><button disabled={busy} onClick={async () => { setBusy(true); try { await gatewayAPI('sync', 'POST'); await props.onSyncKeys?.(); setRevision(value => value + 1); setMessage('用户与价格已同步'); } catch(e) { setMessage((e as Error).message); } finally { setBusy(false); } }}>同步用户与价格</button></div>
++    {message && <p role="alert">{message}</p>}
++    <ApiKeySettingsCard {...props} apiKeys={users} title="API Key 与用户限额" renderPolicy={item => {
++      const policy = policies[links[item.id]];
++      return policy && routing ? <PolicyForm key={`${policy.key_hash}-${revision}`} initial={policy} routing={routing} onSaved={() => {}} /> : <p role="status">{message ? '限额读取失败' : '正在同步用户限额…'}</p>;
++    }} />
++  </div>;
++}
+diff --git a/web/src/features/gateway/api.ts b/web/src/features/gateway/api.ts
+new file mode 100644
+index 0000000..010e3a5
+--- /dev/null
++++ b/web/src/features/gateway/api.ts
+@@ -0,0 +1,11 @@
++export interface Account { id: string; name: string; concurrency: number; enabled: boolean; models: string[] }
++export interface Routing { enabled: boolean; session_ttl_hours: number; overflow_threshold: number; accounts: Account[]; preferences: Record<string, string[]> }
++export interface Policy { key_hash: string; alias: string; limit_usd: number; used_usd: number; remaining_usd: number; rpm: number; concurrency: number; is_superuser: boolean; enabled: boolean; cycle_type: string; cycle_days: number; period_ends_at: string }
++export async function gatewayAPI<T>(path: string, method = 'GET', body?: unknown, signal?: AbortSignal): Promise<T> {
++  const response = await fetch(`/admin/${path}`, { method, credentials: 'same-origin', cache: 'no-store', signal,
++    headers: { 'Content-Type': 'application/json', ...(method !== 'GET' ? { 'X-Quota-Admin-Request': '1' } : {}) },
++    body: body === undefined ? undefined : JSON.stringify(body) });
++  const data = await response.json();
++  if (!response.ok) throw new Error(typeof data.error === 'string' ? data.error : `请求失败 (${response.status})`);
++  return data as T;
++}
+diff --git a/web/src/features/gateway/gateway.css b/web/src/features/gateway/gateway.css
+new file mode 100644
+index 0000000..084fab7
+--- /dev/null
++++ b/web/src/features/gateway/gateway.css
+@@ -0,0 +1,3 @@
++.gw-card{padding:22px;border:1px solid var(--border-color,#dfe3eb);border-radius:16px;background:var(--bg-primary,#fff);color:var(--text-primary,#202938);margin-bottom:20px;box-shadow:0 3px 14px #152a4810}.gw-heading{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}.gw-card h2{font-size:18px;margin:0 0 7px}.gw-card p{color:var(--text-secondary,#68758b);font-size:13px;line-height:1.65;margin:4px 0 16px}.gw-status{font-size:12px;color:#15976e;border:1px solid #91ddc1;border-radius:20px;padding:6px 12px}.gw-error{color:#bd4352;border-color:#e9a7af}.gw-pools{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin-top:20px}.gw-pool{border:1px solid #bacbe04d;border-radius:20px;padding:18px;background:linear-gradient(180deg,#8aa4d00a,#86a1ce12);min-width:0}.gw-pool-active{border-color:#55ba934d;background:linear-gradient(180deg,#48c59708,#48c59712)}.gw-pool-personal{border-color:#a591ce4d;background:linear-gradient(180deg,#a18bd008,#a18bd012)}.gw-pool-title{display:flex;align-items:center;justify-content:space-between}.gw-pool h3{font-size:15px;margin:0}.gw-pool strong{font-size:26px;font-variant-numeric:tabular-nums}.gw-pool strong small{font-size:12px;font-weight:400;color:var(--text-secondary,#68758b)}.gw-balls{min-height:210px;max-height:360px;overflow:auto;display:flex;flex-wrap:wrap;gap:12px;align-items:flex-start;align-content:flex-start;padding:14px 2px}.gw-ball{width:64px;height:64px;flex:0 0 64px;display:flex;align-items:center;justify-content:center;border-radius:50%;color:#fff;background:radial-gradient(circle at 30% 24%,hsl(var(--user-hue) 77% 72%),hsl(var(--user-hue) 62% 43%) 70%);box-shadow:inset 0 -3px 6px #0002,0 5px 9px #22334c16;border:1px solid #ffffff60;animation:gw-arrive .35s ease-out}.gw-ball span{font-size:12px;line-height:1.2;max-width:55px;overflow-wrap:anywhere;text-align:center;text-shadow:0 1px 2px #0005}.gw-pool-active .gw-ball{animation:gw-arrive .35s ease-out,gw-breathe 3s ease-in-out infinite}.gw-pool-empty{align-self:center;display:block;width:100%;text-align:center;color:var(--text-secondary,#68758b);font-size:12px;margin-top:70px}.gw-legend{display:flex;gap:16px;flex-wrap:wrap;margin-top:18px;font-size:12px}.gw-legend span{display:flex;align-items:center;gap:6px}.gw-legend i{width:8px;height:8px;border-radius:50%}.gw-inline{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;margin:16px 0}.gw-card label,.gw-policy label{display:flex;flex-direction:column;gap:6px;font-size:12px;color:var(--text-secondary,#68758b)}.gw-card input:not([type=checkbox]),.gw-card select,.gw-policy input:not([type=checkbox]),.gw-policy select{border:1px solid var(--border-color,#d3dae5);border-radius:8px;background:var(--bg-primary,#fff);color:var(--text-primary,#202938);padding:8px 10px;min-width:0;width:100%}.gw-card input[type=number],.gw-policy input[type=number]{max-width:135px}.gw-check{flex-direction:row!important;align-items:center;gap:6px!important}.gw-card button,.gw-policy button{padding:8px 14px;border-radius:8px;border:1px solid var(--border-color,#d3dae5);background:var(--bg-secondary,#f4f6fa);color:var(--text-primary,#27364f);cursor:pointer}.gw-card button:disabled,.gw-policy button:disabled{opacity:.5;cursor:wait}.gw-table-wrap{overflow:auto;margin:16px 0}.gw-table{width:100%;border-collapse:collapse;text-align:left;font-size:13px}.gw-table th,.gw-table td{padding:12px;border-bottom:1px solid var(--border-color,#dfe3eb)}.gw-table th{font-size:12px;color:var(--text-secondary,#68758b);font-weight:500}.gw-table small{display:block;font-size:11px;color:var(--text-secondary,#68758b);overflow-wrap:anywhere;max-width:320px}.gw-help{max-width:950px}.gw-message{padding:10px;background:#7799ee12;border-radius:8px}.gw-policy{grid-column:1/-1;flex-basis:100%;width:100%;border-top:1px solid var(--border-color,#e2e7ef);padding-top:12px;margin-top:10px}.gw-usage{display:flex;flex-wrap:wrap;gap:18px;font-size:12px}.gw-policy-fields{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;margin-top:12px}.gw-policy-fields>label{min-width:100px}.gw-policy .gw-error{font-size:12px}.gw-card .gw-check input{width:auto}.gw-policy progress{width:120px;accent-color:#5497dc;height:6px}.gw-policy select{max-width:240px}@keyframes gw-arrive{from{transform:scale(.7);opacity:0}to{transform:scale(1);opacity:1}}@keyframes gw-breathe{50%{translate:0 -3px}}@media(prefers-reduced-motion:reduce){.gw-ball,.gw-pool-active .gw-ball{animation:none}}@media(max-width:800px){.gw-pools{grid-template-columns:1fr}.gw-balls{min-height:130px}.gw-pool-empty{margin-top:30px}.gw-card{padding:16px}}
++
++.gw-users>.gw-inline{gap:12px}.gw-users>.gw-inline>input,.gw-users>.gw-inline>button{border:1px solid var(--border-color);border-radius:10px;background:var(--bg-primary);color:var(--text-primary);padding:9px 14px;font-size:12px}.gw-users>.gw-inline>label{font-size:12px}.gw-users>.gw-inline>button{cursor:pointer}.gw-users>.gw-inline>button:disabled{opacity:.5}
+diff --git a/web/src/i18n/index.ts b/web/src/i18n/index.ts
+index d0de019..f46d6c3 100644
+--- a/web/src/i18n/index.ts
++++ b/web/src/i18n/index.ts
+@@ -43,7 +43,7 @@ const resources = {
+         no_requests: 'No requests'
+       },
+       auth: {
+-        login_title: 'CPA USAGE KEEPER',
++        login_title: 'CPA QUOTA GATEWAY',
+         login_subtitle: 'Every flow leaves a trace.',
+         console_kicker: 'Access control',
+         console_title: 'Choose your console',
+@@ -790,7 +790,7 @@ const resources = {
+         no_requests: '暂无请求'
+       },
+       auth: {
+-        login_title: 'CPA USAGE KEEPER',
++        login_title: 'CPA QUOTA GATEWAY',
+         login_subtitle: '万千流转，皆有迹可循。',
+         console_kicker: '访问控制',
+         console_title: '选择访问方式',
+@@ -1537,7 +1537,7 @@ const resources = {
+         no_requests: '尚無請求'
+       },
+       auth: {
+-        login_title: 'CPA USAGE KEEPER',
++        login_title: 'CPA QUOTA GATEWAY',
+         login_subtitle: '萬千流轉，皆有跡可循。',
+         console_kicker: '存取控制',
+         console_title: '選擇存取方式',
+diff --git a/web/src/pages/UsagePage.tsx b/web/src/pages/UsagePage.tsx
+index 58c4cf5..a1e14d5 100644
+--- a/web/src/pages/UsagePage.tsx
++++ b/web/src/pages/UsagePage.tsx
+@@ -1,7 +1,7 @@
+ import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
+ import { useTranslation } from 'react-i18next';
+-import { ApiError, createUsageEventRequestLogDownloadURL, exportUsageEvents, fetchAnalysis, fetchAnalysisLatency, fetchAuthSessions, fetchCpaApiKeyOptions, fetchCpaApiKeySettings, fetchStatus, fetchUpdateCheck, fetchUsageEventModelFilterOptions, fetchUsageEventRequestLog, fetchUsageEventSourceFilterOptions, fetchUsageEvents, fetchVersion, isUsageRangeBoundsConflict, logout, revokeAuthSession, updateCpaApiKeyAlias, type UsageEventsExportFormat } from '@/lib/api';
+-import type { AnalysisLatencyDiagnostics, AnalysisResponse, AuthManagedSessionItem, CpaApiKeyOption, CpaApiKeySettingsItem, OverviewRealtimeWindow, StatusResponse, UsageCustomRange, UsageEvent, UsageEventRequestLogResponse, UsageSourceFilterOption, UsageTimeRange, VersionResponse } from '@/lib/types';
++import { ApiError, createUsageEventRequestLogDownloadURL, exportUsageEvents, fetchAnalysis, fetchAnalysisLatency, fetchCpaApiKeyOptions, fetchCpaApiKeySettings, fetchStatus, fetchUsageEventModelFilterOptions, fetchUsageEventRequestLog, fetchUsageEventSourceFilterOptions, fetchUsageEvents, fetchVersion, isUsageRangeBoundsConflict, logout, updateCpaApiKeyAlias, type UsageEventsExportFormat } from '@/lib/api';
++import type { AnalysisLatencyDiagnostics, AnalysisResponse, CpaApiKeyOption, CpaApiKeySettingsItem, OverviewRealtimeWindow, StatusResponse, UsageCustomRange, UsageEvent, UsageEventRequestLogResponse, UsageSourceFilterOption, UsageTimeRange, VersionResponse } from '@/lib/types';
+ import { LoadingSpinner } from '@/components/ui/LoadingSpinner';
+ import { LanguageSwitcher } from '@/components/ui/LanguageSwitcher';
+ import { Select } from '@/components/ui/Select';
+@@ -17,8 +17,6 @@ import {
+   RecentActivityPanel,
+   OverviewRealtimePanel,
+   AnalysisPanel,
+-  ApiKeySettingsCard,
+-  SessionSettingsCard,
+   PriceSettingsCard,
+   AuthFileCredentialsSection,
+   AiProviderCredentialsSection,
+@@ -44,13 +42,10 @@ import { getDailyAverageCardUsage, isDailyAverageRange } from '@/utils/usage/ove
+ import type { Theme } from '@/types';
+ import { BrandLink } from '@/components/BrandLink';
+ import { isCPAMCEmbed } from '@/embed/cpamcEmbed';
+-import { RankingPage } from '@/features/ranking/RankingPage';
+-import { RankingScopeSwitch } from '@/features/ranking/components/RankingScopeSwitch';
+-import { useRankingData } from '@/features/ranking/hooks/useRankingData';
+-import { useLocalRankingData } from '@/features/ranking/hooks/useLocalRankingData';
+-import { resolveLocalRankingPreviewAPI, resolveRankingPreviewAPI } from '@/features/ranking/previewMock';
+-import { loadRankingScope, persistRankingScope } from '@/features/ranking/scope';
+-import type { LocalRankingProfileRequest, RankingScope } from '@/features/ranking/types';
++import { QueuePools } from '@/features/gateway/QueuePools';
++import { AccountRouting } from '@/features/gateway/AccountRouting';
++import { UserQuotaSettings } from '@/features/gateway/UserQuotaSettings';
++import { LocalRankingPanel } from '@/features/gateway/LocalRankingPanel';
+ import styles from './UsagePage.module.scss';
+ 
+ const TIME_RANGE_STORAGE_KEY = 'cli-proxy-usage-time-range-v1';
+@@ -65,8 +60,6 @@ const THEME_OPTIONS: ReadonlyArray<{ value: Theme; labelKey: string }> = [
+   { value: 'auto', labelKey: 'usage_stats.theme_auto' }
+ ];
+ const USAGE_TAB_OPTIONS = ['overview', 'analysis', 'ranking', 'events', 'auth-files', 'ai-provider', 'settings'] as const;
+-const RANKING_PREVIEW_API = resolveRankingPreviewAPI(import.meta.env.VITE_RANKING_PREVIEW_MOCK);
+-const LOCAL_RANKING_PREVIEW_API = resolveLocalRankingPreviewAPI(import.meta.env.VITE_RANKING_PREVIEW_MOCK);
+ type UsageTab = (typeof USAGE_TAB_OPTIONS)[number];
+ type Translate = (key: string) => string;
+ const USAGE_TAB_LABEL_KEYS: Record<UsageTab, string> = {
+@@ -785,9 +778,9 @@ export const normalizeUsageTabValue = (value: unknown): UsageTab | null => {
+ 
+ export const getUsageTabOptions = (
+   translate: Translate,
+-  { includeRanking = true }: { includeRanking?: boolean } = {},
++  _options: { includeRanking?: boolean } = {},
+ ): Array<{ value: UsageTab; label: string }> =>
+-  USAGE_TAB_OPTIONS.filter((value) => includeRanking || value !== 'ranking').map((value) => ({
++  USAGE_TAB_OPTIONS.filter((value) => value !== 'ranking').map((value) => ({
+     value,
+     label: translate(USAGE_TAB_LABEL_KEYS[value]),
+   }));
+@@ -851,13 +844,9 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+   const isDark = resolvedTheme === 'dark';
+   const [activeTab, setActiveTab] = useState<UsageTab>(() => {
+     const loadedTab = loadUsageTab();
+-    return isEmbeddedInCPAMC && loadedTab === 'ranking' ? DEFAULT_USAGE_TAB : loadedTab;
++    return loadedTab === 'ranking' ? 'analysis' : loadedTab;
+   });
+-  const [rankingScope, setRankingScope] = useState<RankingScope>(loadRankingScope);
+-  const handleRankingScopeChange = useCallback((scope: RankingScope) => {
+-    setRankingScope(scope);
+-    persistRankingScope(scope);
+-  }, []);
++
+   const [loadedTimeRange] = useState(loadTimeRange);
+   const pendingLegacyCustomRangeRef = useRef(loadedTimeRange.pendingLegacyCustomRange);
+   const [timeRangeState, setTimeRangeState] = useState<StoredUsageRangeState>(loadedTimeRange.state);
+@@ -866,7 +855,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+   const [selectedApiKeyId, setSelectedApiKeyId] = useState('');
+   const [apiKeyOptions, setApiKeyOptions] = useState<CpaApiKeyOption[]>([]);
+   const [status, setStatus] = useState<StatusResponse | null>(null);
+-  const [versionInfo, setVersionInfo] = useState<VersionResponse | null>(null);
++  const [, setVersionInfo] = useState<VersionResponse | null>(null);
+   const apiKeyOptionsRequestControllerRef = useRef<AbortController | null>(null);
+   const credentialSectionVisibility = getCredentialSectionVisibility(activeTab);
+   const activeCustomRange = useMemo(() => getUsageCustomRangeForTab(activeTab, customRange, {
+@@ -976,15 +965,8 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+   const [apiKeySettingsError, setApiKeySettingsError] = useState('');
+   const [apiKeySettingsSavingId, setApiKeySettingsSavingId] = useState<string | null>(null);
+   const apiKeySettingsRequestControllerRef = useRef<AbortController | null>(null);
+-  const [authSessions, setAuthSessions] = useState<AuthManagedSessionItem[]>([]);
+-  const [authSessionsLoading, setAuthSessionsLoading] = useState(false);
+-  const [authSessionsError, setAuthSessionsError] = useState('');
+-  const [authSessionRevokingId, setAuthSessionRevokingId] = useState<string | null>(null);
+-  const authSessionsRequestControllerRef = useRef<AbortController | null>(null);
+   const [statusError, setStatusError] = useState('');
+-  const [updateCheckLoading, setUpdateCheckLoading] = useState(false);
+   const [topNotice, setTopNotice] = useState<{ kind: TopNoticeKind; message: string } | null>(null);
+-  const [hasNewVersion, setHasNewVersion] = useState(false);
+   const [loggingOut, setLoggingOut] = useState(false);
+   const [logoutConfirmOpen, setLogoutConfirmOpen] = useState(false);
+   const topNoticeTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
+@@ -1026,45 +1008,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+       topNoticeTimerRef.current = null;
+     }, getUpdateCheckToastDuration(kind));
+   }, []);
+-  const handleRankingBackgroundRefreshError = useCallback(() => {
+-    showTopNotice('error', t('ranking.refresh_failed'));
+-  }, [showTopNotice, t]);
+-  const rankingData = useRankingData({
+-    enabled: activeTab === 'ranking' && !isEmbeddedInCPAMC && rankingScope === 'community',
+-    onAuthRequired,
+-    onBackgroundRefreshError: handleRankingBackgroundRefreshError,
+-    api: RANKING_PREVIEW_API,
+-  });
+-  const localRankingData = useLocalRankingData({
+-    enabled: activeTab === 'ranking' && !isEmbeddedInCPAMC && rankingScope === 'local',
+-    period: rankingData.period,
+-    metric: rankingData.metric,
+-    onAuthRequired,
+-    onBackgroundRefreshError: handleRankingBackgroundRefreshError,
+-    api: LOCAL_RANKING_PREVIEW_API,
+-  });
+-  const updateLocalRankingProfile = localRankingData.updateProfile;
+-  const patchLocalRankingProfileCache = localRankingData.patchProfileCache;
+-  const displayedRankingLeaderboard = rankingScope === 'community'
+-    ? rankingData.leaderboard
+-    : localRankingData.leaderboard;
+-  const refreshCommunityRanking = rankingData.refreshRanking;
+-  const refreshLocalRanking = localRankingData.refreshLeaderboard;
+-  const refreshRanking = useCallback(
+-    () => rankingScope === 'community' ? refreshCommunityRanking() : refreshLocalRanking(),
+-    [rankingScope, refreshCommunityRanking, refreshLocalRanking],
+-  );
+-  const handleUpdateLocalRankingProfile = useCallback(async (participantID: string, profile: LocalRankingProfileRequest) => {
+-    const updated = await updateLocalRankingProfile(participantID, profile);
+-    // 排行资料与设置页共用同一 Key 记录，保存后同步刷新已加载的别名投影。
+-    setApiKeySettings((current) => current.map((item) => item.id === updated.participant_id
+-      ? { ...item, keyAlias: updated.key_alias, label: updated.display_name }
+-      : item));
+-    setApiKeyOptions((current) => current.map((item) => item.id === updated.participant_id
+-      ? { ...item, label: updated.display_name }
+-      : item));
+-    return updated;
+-  }, [updateLocalRankingProfile]);
+   const credentialsData = useCredentialsTabData({
+     enabledAuthFiles: credentialSectionVisibility.showAuthFiles && pageVisible,
+     enabledAiProviders: credentialSectionVisibility.showAiProvider && pageVisible,
+@@ -1112,7 +1055,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+     if (topNotice.kind === 'success') return styles.updateCheckToastSuccess;
+     return styles.updateCheckToastInfo;
+   })() : '';
+-  const cpaManagementURL = useMemo(() => getBackToCPALinkURL(status), [status]);
+ 
+   const loadApiKeyOptions = useCallback(async () => {
+     apiKeyOptionsRequestControllerRef.current?.abort();
+@@ -1174,39 +1116,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+     }
+   }, [onAuthRequired]);
+ 
+-  const loadAuthSessions = useCallback(async () => {
+-    authSessionsRequestControllerRef.current?.abort();
+-    const controller = new AbortController();
+-    authSessionsRequestControllerRef.current = controller;
+-
+-    setAuthSessionsLoading(true);
+-    setAuthSessionsError('');
+-    try {
+-      const response = await fetchAuthSessions(controller.signal);
+-      if (authSessionsRequestControllerRef.current !== controller) {
+-        return;
+-      }
+-      setAuthSessions(response.items ?? []);
+-    } catch (error) {
+-      if (controller.signal.aborted) {
+-        return;
+-      }
+-      if (authSessionsRequestControllerRef.current === controller) {
+-        setAuthSessions([]);
+-      }
+-      if (error instanceof ApiError && error.status === 401) {
+-        onAuthRequired?.();
+-        return;
+-      }
+-      setAuthSessionsError(error instanceof Error ? error.message : 'Failed to load auth sessions');
+-    } finally {
+-      if (authSessionsRequestControllerRef.current === controller) {
+-        setAuthSessionsLoading(false);
+-        authSessionsRequestControllerRef.current = null;
+-      }
+-    }
+-  }, [onAuthRequired]);
+-
+   const handleSaveApiKeyAlias = useCallback(async (id: string, keyAlias: string) => {
+     setApiKeySettingsSavingId(id);
+     setApiKeySettingsError('');
+@@ -1214,10 +1123,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+       const updated = await updateCpaApiKeyAlias(id, keyAlias);
+       setApiKeySettings((current) => current.map((item) => (item.id === updated.id ? { ...item, ...updated } : item)));
+       setApiKeyOptions((current) => current.map((item) => (item.id === updated.id ? updated : item)));
+-      patchLocalRankingProfileCache(updated.id, {
+-        key_alias: updated.keyAlias,
+-        display_name: updated.label,
+-      });
+       showTopNotice('success', t('usage_stats.api_key_settings_alias_save_success'));
+     } catch (error) {
+       if (error instanceof ApiError && error.status === 401) {
+@@ -1229,30 +1134,8 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+     } finally {
+       setApiKeySettingsSavingId(null);
+     }
+-  }, [onAuthRequired, patchLocalRankingProfileCache, showTopNotice, t]);
++  }, [onAuthRequired, showTopNotice, t]);
+ 
+-  const handleRevokeAuthSession = useCallback(async (session: AuthManagedSessionItem) => {
+-    setAuthSessionRevokingId(session.id);
+-    setAuthSessionsError('');
+-    try {
+-      await revokeAuthSession(session.id);
+-      showTopNotice('success', t('usage_stats.session_settings_logout_success'));
+-      if (session.current) {
+-        onAuthRequired?.();
+-        return;
+-      }
+-      await loadAuthSessions();
+-    } catch (error) {
+-      if (error instanceof ApiError && error.status === 401) {
+-        onAuthRequired?.();
+-        return;
+-      }
+-      setAuthSessionsError(error instanceof Error ? error.message : 'Failed to revoke auth session');
+-      showTopNotice('error', t('usage_stats.session_settings_logout_failed'));
+-    } finally {
+-      setAuthSessionRevokingId(null);
+-    }
+-  }, [loadAuthSessions, onAuthRequired, showTopNotice, t]);
+ 
+   const loadAnalysis = useCallback(async () => {
+     if (!usageRangeQuery.valid) return;
+@@ -1435,11 +1318,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+     }
+   }, [apiKeyOptions, selectedApiKeyId]);
+ 
+-  useEffect(() => {
+-    if (!shouldShowUpdateCheckButton(versionInfo)) {
+-      setHasNewVersion(false);
+-    }
+-  }, [versionInfo]);
++
+ 
+   useEffect(() => () => {
+     if (topNoticeTimerRef.current !== null) {
+@@ -1656,10 +1535,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+       await Promise.all([loadEventFilterOptions(), loadEvents()]);
+       return;
+     }
+-    if (activeTab === 'ranking') {
+-      await refreshRanking();
+-      return;
+-    }
++
+     if (credentialSectionVisibility.enabled) {
+       await refreshCredentials();
+       return;
+@@ -1669,11 +1545,11 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+       return;
+     }
+     if (activeTab === 'settings') {
+-      await Promise.all([loadAuthSessions(), loadApiKeySettings(), loadPricing()]);
++      await Promise.all([loadApiKeySettings(), loadPricing()]);
+       return;
+     }
+     await Promise.all([loadUsage(), loadActivity(), loadRealtime()]);
+-  }, [activeTab, credentialSectionVisibility.enabled, loadActivity, loadAnalysis, loadApiKeySettings, loadAuthSessions, loadEventFilterOptions, loadEvents, loadPricing, loadRealtime, loadUsage, refreshCredentials, refreshRanking]);
++  }, [activeTab, credentialSectionVisibility.enabled, loadActivity, loadAnalysis, loadApiKeySettings, loadEventFilterOptions, loadEvents, loadPricing, loadRealtime, loadUsage, refreshCredentials]);
+ 
+   const refreshAutoRefreshTab = useCallback(async () => {
+     if (activeTab === 'events') {
+@@ -1732,34 +1608,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+     }
+   }, [onAuthRequired]);
+ 
+-  const handleUpdateCheck = useCallback(async () => {
+-    setUpdateCheckLoading(true);
+-    try {
+-      const result = await fetchUpdateCheck();
+-      if (!result.canCompare) {
+-        setHasNewVersion(false);
+-        showTopNotice('info', t('usage_stats.update_check_dev_build'));
+-        return;
+-      }
+-      if (result.updateAvailable) {
+-        setHasNewVersion(true);
+-        showTopNotice('success', t('usage_stats.update_check_new_version', { version: result.latestVersion }));
+-        return;
+-      }
+-      setHasNewVersion(false);
+-      showTopNotice('info', t('usage_stats.update_check_latest'));
+-    } catch (error) {
+-      if (error instanceof ApiError && error.status === 401) {
+-        onAuthRequired?.();
+-        return;
+-      }
+-      setHasNewVersion(false);
+-      showTopNotice('error', t('usage_stats.update_check_failed'));
+-    } finally {
+-      setUpdateCheckLoading(false);
+-    }
+-  }, [onAuthRequired, showTopNotice, t]);
+-
+   useEffect(() => scheduleOverviewAutoRefresh({
+     enabled: autoRefreshEnabled,
+     refreshOverview: refreshAutoRefreshTab,
+@@ -1826,20 +1674,14 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+       apiKeySettingsRequestControllerRef.current?.abort();
+       apiKeySettingsRequestControllerRef.current = null;
+       setApiKeySettingsLoading(false);
+-      authSessionsRequestControllerRef.current?.abort();
+-      authSessionsRequestControllerRef.current = null;
+-      setAuthSessionsLoading(false);
+       return;
+     }
+     void loadApiKeySettings();
+-    void loadAuthSessions();
+     return () => {
+       apiKeySettingsRequestControllerRef.current?.abort();
+       apiKeySettingsRequestControllerRef.current = null;
+-      authSessionsRequestControllerRef.current?.abort();
+-      authSessionsRequestControllerRef.current = null;
+     };
+-  }, [activeTab, loadApiKeySettings, loadAuthSessions]);
++  }, [activeTab, loadApiKeySettings]);
+ 
+   useEffect(() => {
+     const next = sanitizeRequestEventFilters(
+@@ -1877,7 +1719,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+     : '';
+   // 只有需要时间范围的 tab 才渲染 Range 控件，避免 Credentials/Pricing 产生空白占位。
+   const showRangeControls = shouldShowRangeControls(activeTab);
+-  const showRankingScopeControl = activeTab === 'ranking' && !isEmbeddedInCPAMC;
+   const {
+     requestsSparkline,
+     tokensSparkline,
+@@ -1922,30 +1763,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+                 );
+               })}
+             </div>
+-            {shouldShowUpdateCheckButton(versionInfo) && (
+-              <div className={styles.updateCheckSwitcher} role="group" aria-label={t('usage_stats.check_updates')}>
+-                <button
+-                  type="button"
+-                  className={`${styles.updateCheckPill} ${styles.updateCheckPillActive} ${updateCheckLoading ? styles.updateCheckPillLoading : ''}`.trim()}
+-                  onClick={() => void handleUpdateCheck()}
+-                  disabled={updateCheckLoading}
+-                  aria-busy={updateCheckLoading}
+-                  aria-pressed={hasNewVersion}
+-                >
+-                  {updateCheckLoading ? (
+-                    <span className={styles.updateCheckPillInner}>
+-                      <LoadingSpinner size={12} className={styles.updateCheckSpinner} />
+-                      <span>{t('common.loading')}</span>
+-                    </span>
+-                  ) : (
+-                    <span className={styles.updateCheckPillInner}>
+-                      <span>{t('usage_stats.check_updates')}</span>
+-                      {hasNewVersion && <span className={styles.updateCheckDot} aria-hidden="true" />}
+-                    </span>
+-                  )}
+-                </button>
+-              </div>
+-            )}
+             <MainActionButton
+               type="button"
+               aria-label={t('common.logout')}
+@@ -1969,27 +1786,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+               </div>
+             )}
+ 
+-            {(!isEmbeddedInCPAMC && cpaManagementURL) && (
+-              <div className={styles.toolbarMetaRow}>
+-                <div className={styles.toolbarMetaRight}>
+-                  <a
+-                    className={styles.backToCpaLink}
+-                    href={cpaManagementURL}
+-                    target="_blank"
+-                    rel="noreferrer"
+-                    aria-label={t('usage_stats.back_to_cpa_aria')}
+-                  >
+-                    <span>{t('usage_stats.back_to_cpa')}</span>
+-                    <span className={styles.backToCpaIcon} aria-hidden="true">
+-                      <svg viewBox="0 0 16 16" focusable="false">
+-                        <path d="M6 4h6v6" />
+-                        <path d="M12 4 5 11" />
+-                      </svg>
+-                    </span>
+-                  </a>
+-                </div>
+-              </div>
+-            )}
+ 
+             {topNotice && (
+               <div
+@@ -2072,17 +1868,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+                     </div>
+                   </div>
+                   )}
+-                  {!isEmbeddedInCPAMC && (
+-                    <div
+-                      className={`${styles.rankingScopeTransition} ${showRankingScopeControl ? styles.rankingScopeTransitionOpen : ''}`.trim()}
+-                      aria-hidden={!showRankingScopeControl}
+-                      inert={!showRankingScopeControl}
+-                    >
+-                      <div className={styles.rankingScopeTransitionInner}>
+-                        <RankingScopeSwitch value={rankingScope} onChange={handleRankingScopeChange} />
+-                      </div>
+-                    </div>
+-                  )}
+                 </div>
+                 <div className={styles.usageRefreshSlot}>
+                   <div className={styles.usageFilterActions}>
+@@ -2108,9 +1893,8 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+ 
+             {activeTab === 'overview' && error && <div className={styles.errorBox}>{error === 'AUTH_REQUIRED' ? t('auth.session_expired') : error}</div>}
+             {activeTab === 'settings' && pricingError && <div className={styles.errorBox}>{pricingError === 'AUTH_REQUIRED' ? t('auth.session_expired') : pricingError}</div>}
+-            {activeTab === 'settings' && authSessionsError && <div className={styles.errorBox}>{authSessionsError}</div>}
+             {activeTab === 'settings' && apiKeySettingsError && <div className={styles.errorBox}>{apiKeySettingsError}</div>}
+-            {!(activeTab === 'overview' ? error : activeTab === 'settings' ? (pricingError || authSessionsError || apiKeySettingsError) : '') && displayStatusError && <div className={styles.errorBox}>{displayStatusError}</div>}
++            {!(activeTab === 'overview' ? error : activeTab === 'settings' ? (pricingError || apiKeySettingsError) : '') && displayStatusError && <div className={styles.errorBox}>{displayStatusError}</div>}
+ 
+             {activeTab === 'overview' && (
+               <>
+@@ -2154,6 +1938,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+ 
+             {activeTab === 'analysis' && (
+               <>
++                <LocalRankingPanel onAuthRequired={onAuthRequired} />
+                 {analysisError && <div className={styles.errorBox}>{analysisError}</div>}
+                 <AnalysisPanel
+                   analysis={analysisData}
+@@ -2167,40 +1952,9 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+               </>
+             )}
+ 
+-            {activeTab === 'ranking' && (
+-              <RankingPage
+-                key={rankingScope}
+-                scope={rankingScope}
+-                period={rankingData.period}
+-                metric={rankingData.metric}
+-                status={rankingScope === 'community' ? rankingData.status : null}
+-                metadata={rankingScope === 'community' ? rankingData.metadata : null}
+-                leaderboard={displayedRankingLeaderboard}
+-                statusLoading={rankingScope === 'community' && rankingData.statusLoading}
+-                metadataLoading={rankingScope === 'community' && rankingData.metadataLoading}
+-                leaderboardLoading={rankingScope === 'community' ? rankingData.leaderboardLoading : localRankingData.leaderboardLoading}
+-                statusError={rankingScope === 'community' ? rankingData.statusError : null}
+-                metadataError={rankingScope === 'community' ? rankingData.metadataError : null}
+-                leaderboardError={rankingScope === 'community' ? rankingData.leaderboardError : localRankingData.leaderboardError}
+-                action={rankingScope === 'community' ? rankingData.action : null}
+-                actionError={rankingScope === 'community' ? rankingData.actionError : null}
+-                onClearActionError={rankingData.clearActionError}
+-                onJoin={rankingData.join}
+-                onSync={rankingData.sync}
+-                onPause={rankingData.pause}
+-                onResume={rankingData.resume}
+-                onExit={rankingData.exit}
+-                onRetryStatus={rankingData.refreshStatus}
+-                onRetryMetadata={rankingData.refreshMetadata}
+-                onRetryLeaderboard={rankingScope === 'community' ? rankingData.refreshLeaderboard : localRankingData.refreshLeaderboard}
+-                onUpdateLocalProfile={handleUpdateLocalRankingProfile}
+-                onPeriodChange={rankingData.setPeriod}
+-                onMetricChange={rankingData.setMetric}
+-              />
+-            )}
+-
+             {activeTab === 'events' && (
+               <>
++                <QueuePools />
+                 {eventsError && <div className={styles.errorBox}>{eventsError}</div>}
+                 <RequestEventsDetailsCard
+                   events={eventsData}
+@@ -2240,6 +1994,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+ 
+             {credentialSectionVisibility.enabled && (
+               <>
++                {credentialSectionVisibility.showAuthFiles && <AccountRouting />}
+                 {credentialsData.error && <div className={styles.errorBox}>{credentialsData.error}</div>}
+                 <CredentialProviderFilterBar
+                   scope={activeCredentialProviderFilterScope}
+@@ -2300,13 +2055,8 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+ 
+             {activeTab === 'settings' && (
+               <div className={styles.settingsSections}>
+-                <SessionSettingsCard
+-                  sessions={authSessions}
+-                  loading={authSessionsLoading}
+-                  revokingId={authSessionRevokingId}
+-                  onLogout={handleRevokeAuthSession}
+-                />
+-                <ApiKeySettingsCard
++                <UserQuotaSettings
++                  onSyncKeys={loadApiKeySettings}
+                   apiKeys={apiKeySettings}
+                   loading={apiKeySettingsLoading}
+                   savingId={apiKeySettingsSavingId}
+-- 
+2.43.0
+

@@ -1,5 +1,7 @@
 # CPA Quota Gateway
 
+See [the integration guide](INTEGRATION.zh-CN.md) for the unified Keeper console, account routing and reproducible builds. The previous production baseline remains on `main` (`2408701`).
+
 [简体中文](README.zh-CN.md) | English
 
 `cpa-quota-gateway` is an independent quota and rate-limit gateway for
