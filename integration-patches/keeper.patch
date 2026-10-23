@@ -482,6 +482,321 @@ index 0000000..3608bcc
 +	})
 +	return result, nil
 +}
+diff --git a/internal/service/request_archive.go b/internal/service/request_archive.go
+new file mode 100644
+index 0000000..0ce7ef9
+--- /dev/null
++++ b/internal/service/request_archive.go
+@@ -0,0 +1,143 @@
++package service
++
++import (
++	"bytes"
++	"compress/gzip"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"strings"
++)
++
++// Gateway owns these tables in the shared database. Token metadata stays in
++// usage_events; the compressed body is never selected by statistics queries.
++type archivedRequest struct {
++	ReceivedAt    string
++	Endpoint      string
++	UserAlias     string
++	BodyGzip      []byte
++	OriginalBytes int64
++}
++
++func (s *requestLogService) archivedRequest(ctx context.Context, requestID string) (*archivedRequest, error) {
++	db := s.db.WithContext(ctx)
++	if !db.Migrator().HasTable("request_payloads") {
++		return nil, nil
++	}
++	var row archivedRequest
++	result := db.Raw(`SELECT r.received_at, r.endpoint, r.user_alias, p.body_gzip, p.original_bytes
++		FROM request_attempts a JOIN request_records r ON r.id=a.record_id
++		JOIN request_payloads p ON p.id=r.payload_id WHERE a.request_id=? LIMIT 1`, requestID).Scan(&row)
++	if result.Error != nil {
++		return nil, fmt.Errorf("load compressed request: %w", result.Error)
++	}
++	if result.RowsAffected == 0 {
++		return nil, nil
++	}
++	refsReader, err := gzip.NewReader(bytes.NewReader(row.BodyGzip))
++	if err != nil {
++		return nil, fmt.Errorf("open prompt references: %w", err)
++	}
++	var references struct {
++		IDs []string `json:"user_prompt_ids"`
++	}
++	err = json.NewDecoder(refsReader).Decode(&references)
++	refsReader.Close()
++	if err != nil || references.IDs == nil {
++		return nil, fmt.Errorf("invalid user prompt references")
++	}
++	type promptRow struct {
++		ID            string
++		TextGzip      []byte
++		OriginalBytes int64
++	}
++	texts := make(map[string]string)
++	for start := 0; start < len(references.IDs); start += 500 {
++		end := min(start+500, len(references.IDs))
++		var prompts []promptRow
++		if err := db.Table("user_prompts").Where("id IN ?", references.IDs[start:end]).Find(&prompts).Error; err != nil {
++			return nil, fmt.Errorf("load user prompts: %w", err)
++		}
++		for _, prompt := range prompts {
++			reader, err := gzip.NewReader(bytes.NewReader(prompt.TextGzip))
++			if err != nil {
++				return nil, fmt.Errorf("open user prompt: %w", err)
++			}
++			body, err := io.ReadAll(io.LimitReader(reader, prompt.OriginalBytes+1))
++			reader.Close()
++			if err != nil || int64(len(body)) != prompt.OriginalBytes {
++				return nil, fmt.Errorf("invalid user prompt data")
++			}
++			texts[prompt.ID] = string(body)
++		}
++	}
++	ordered := make([]string, 0, len(references.IDs))
++	for _, id := range references.IDs {
++		text, found := texts[id]
++		if !found {
++			return nil, fmt.Errorf("user prompt is missing")
++		}
++		ordered = append(ordered, text)
++	}
++	body, err := json.MarshalIndent(map[string][]string{"user_prompts": ordered}, "", "  ")
++	if err != nil {
++		return nil, err
++	}
++	var compressed bytes.Buffer
++	writer := gzip.NewWriter(&compressed)
++	if _, err := writer.Write(body); err != nil {
++		return nil, err
++	}
++	if err := writer.Close(); err != nil {
++		return nil, err
++	}
++	row.BodyGzip = compressed.Bytes()
++	row.OriginalBytes = int64(len(body))
++	return &row, nil
++}
++
++func (r *archivedRequest) info(requestID string) string {
++	return fmt.Sprintf("Request ID: %s\nTimestamp: %s\nURL: %s\nUser: %s\n", requestID, r.ReceivedAt, r.Endpoint, r.UserAlias)
++}
++
++func (r *archivedRequest) preview(eventID int64, requestID string) (RequestLogResponse, error) {
++	response := RequestLogResponse{EventID: eventID, RequestID: requestID, Filename: "request-" + requestID + ".log", Available: true, Downloadable: true}
++	reader, err := gzip.NewReader(bytes.NewReader(r.BodyGzip))
++	if err != nil {
++		return RequestLogResponse{}, fmt.Errorf("open compressed request: %w", err)
++	}
++	defer reader.Close()
++	if r.OriginalBytes > int64(requestLogMaxBytes) {
++		response.TooLarge = true
++		return response, nil
++	}
++	body, err := io.ReadAll(io.LimitReader(reader, int64(requestLogMaxBytes)+1))
++	if err != nil {
++		return RequestLogResponse{}, fmt.Errorf("decode compressed request: %w", err)
++	}
++	if len(body) > requestLogMaxBytes {
++		response.TooLarge = true
++		return response, nil
++	}
++	response.Previewable = true
++	response.Sections = []RequestLogSection{{Title: "REQUEST INFO", Content: r.info(requestID)}, {Title: "USER PROMPTS", Content: string(body)}}
++	return response, nil
++}
++
++type archivedRequestReader struct {
++	io.Reader
++	io.Closer
++}
++
++func (r *archivedRequest) download(eventID int64, requestID string) (RequestLogDownload, error) {
++	reader, err := gzip.NewReader(bytes.NewReader(r.BodyGzip))
++	if err != nil {
++		return RequestLogDownload{}, fmt.Errorf("open compressed request: %w", err)
++	}
++	prefix := "=== REQUEST INFO ===\n" + r.info(requestID) + "\n=== USER PROMPTS ===\n"
++	return RequestLogDownload{EventID: eventID, RequestID: requestID,
++		Filename: "request-" + requestID + ".log", ContentType: "text/plain; charset=utf-8",
++		ContentLength: int64(len(prefix)) + r.OriginalBytes, Downloadable: true,
++		Body: &archivedRequestReader{Reader: io.MultiReader(strings.NewReader(prefix), reader), Closer: reader}}, nil
++}
+diff --git a/internal/service/request_log.go b/internal/service/request_log.go
+index 35af55b..e64c90e 100644
+--- a/internal/service/request_log.go
++++ b/internal/service/request_log.go
+@@ -90,9 +90,6 @@ func (s *requestLogService) GetUsageEventRequestLog(ctx context.Context, eventID
+ 	if s.db == nil {
+ 		return RequestLogResponse{}, fmt.Errorf("database is nil")
+ 	}
+-	if s.client == nil {
+-		return RequestLogResponse{}, fmt.Errorf("request log client is not configured")
+-	}
+ 	requestID, err := repository.FindUsageEventRequestIDByID(s.db.WithContext(ctx), eventID)
+ 	if err != nil {
+ 		return RequestLogResponse{}, err
+@@ -100,6 +97,16 @@ func (s *requestLogService) GetUsageEventRequestLog(ctx context.Context, eventID
+ 	if requestID == "" {
+ 		return RequestLogResponse{EventID: eventID, Available: false}, ErrRequestLogMissingID
+ 	}
++	archived, err := s.archivedRequest(ctx, requestID)
++	if err != nil {
++		return RequestLogResponse{}, err
++	}
++	if archived != nil {
++		return archived.preview(eventID, requestID)
++	}
++	if s.client == nil {
++		return RequestLogResponse{}, fmt.Errorf("request log client is not configured")
++	}
+ 
+ 	inflight, leader := s.beginFetch(requestID)
+ 	if leader {
+@@ -171,9 +178,6 @@ func (s *requestLogService) DownloadUsageEventRequestLog(ctx context.Context, ev
+ 	if s.db == nil {
+ 		return RequestLogDownload{}, fmt.Errorf("database is nil")
+ 	}
+-	if s.client == nil {
+-		return RequestLogDownload{}, fmt.Errorf("request log client is not configured")
+-	}
+ 	requestID, err := repository.FindUsageEventRequestIDByID(s.db.WithContext(ctx), eventID)
+ 	if err != nil {
+ 		return RequestLogDownload{}, err
+@@ -181,6 +185,16 @@ func (s *requestLogService) DownloadUsageEventRequestLog(ctx context.Context, ev
+ 	if requestID == "" {
+ 		return RequestLogDownload{EventID: eventID, Downloadable: false}, ErrRequestLogMissingID
+ 	}
++	archived, err := s.archivedRequest(ctx, requestID)
++	if err != nil {
++		return RequestLogDownload{}, err
++	}
++	if archived != nil {
++		return archived.download(eventID, requestID)
++	}
++	if s.client == nil {
++		return RequestLogDownload{}, fmt.Errorf("request log client is not configured")
++	}
+ 	result, err := s.client.OpenRequestLogByID(ctx, requestID)
+ 	if err != nil {
+ 		if result != nil && result.StatusCode == http.StatusNotFound {
+diff --git a/internal/service/test/request_archive_test.go b/internal/service/test/request_archive_test.go
+new file mode 100644
+index 0000000..56fb0bd
+--- /dev/null
++++ b/internal/service/test/request_archive_test.go
+@@ -0,0 +1,102 @@
++package test
++
++import (
++	"bytes"
++	"compress/gzip"
++	"context"
++	"encoding/json"
++	"io"
++	"strings"
++	"testing"
++
++	"cpa-usage-keeper/internal/entities"
++	"cpa-usage-keeper/internal/service"
++)
++
++func TestRequestArchivePreviewAndDownloadWithoutCPA(t *testing.T) {
++	db := openRequestLogTestDB(t)
++	for _, statement := range []string{
++		`CREATE TABLE user_prompts(id TEXT PRIMARY KEY, text_gzip BLOB, original_bytes INTEGER)`,
++		`CREATE TABLE request_payloads(id TEXT PRIMARY KEY, body_gzip BLOB, original_bytes INTEGER)`,
++		`CREATE TABLE request_records(id TEXT PRIMARY KEY, received_at TEXT, endpoint TEXT, user_alias TEXT, payload_id TEXT)`,
++		`CREATE TABLE request_attempts(request_id TEXT PRIMARY KEY, record_id TEXT)`,
++	} {
++		if err := db.Exec(statement).Error; err != nil {
++			t.Fatal(err)
++		}
++	}
++	zip := func(body []byte) []byte {
++		var compressed bytes.Buffer
++		writer := gzip.NewWriter(&compressed)
++		if _, err := writer.Write(body); err != nil {
++			t.Fatal(err)
++		}
++		if err := writer.Close(); err != nil {
++			t.Fatal(err)
++		}
++		return compressed.Bytes()
++	}
++	body := []byte("用户提示词")
++	refs := []byte(`{"user_prompt_ids":["prompt","prompt"]}`)
++	if err := db.Exec(`INSERT INTO request_payloads VALUES('payload',?,?)`, zip(refs), len(refs)).Error; err != nil {
++		t.Fatal(err)
++	}
++	if err := db.Exec(`INSERT INTO user_prompts VALUES('prompt',?,?)`, zip(body), len(body)).Error; err != nil {
++		t.Fatal(err)
++	}
++	if err := db.Exec(`INSERT INTO request_records VALUES('receipt','2026-10-23T00:00:00Z','/v1/responses','小林','payload')`).Error; err != nil {
++		t.Fatal(err)
++	}
++	if err := db.Exec(`INSERT INTO request_attempts VALUES('request-id','receipt')`).Error; err != nil {
++		t.Fatal(err)
++	}
++	event := entities.UsageEvent{EventKey: "archive-event", RequestID: "request-id"}
++	if err := db.Create(&event).Error; err != nil {
++		t.Fatal(err)
++	}
++	svc := service.NewRequestLogService(db, nil)
++	preview, err := svc.GetUsageEventRequestLog(context.Background(), event.ID)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !preview.Available || !preview.Previewable || len(preview.Sections) != 2 || preview.Sections[1].Title != "USER PROMPTS" {
++		t.Fatalf("unexpected preview: %+v", preview)
++	}
++	var decoded struct {
++		Prompts []string `json:"user_prompts"`
++	}
++	if err := json.Unmarshal([]byte(preview.Sections[1].Content), &decoded); err != nil {
++		t.Fatal(err)
++	}
++	if len(decoded.Prompts) != 2 || decoded.Prompts[0] != string(body) || decoded.Prompts[1] != string(body) {
++		t.Fatal("prompt order lost")
++	}
++	download, err := svc.DownloadUsageEventRequestLog(context.Background(), event.ID)
++	if err != nil {
++		t.Fatal(err)
++	}
++	content, err := io.ReadAll(download.Body)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := download.Body.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if int64(len(content)) != download.ContentLength || !strings.Contains(string(content), string(body)) {
++		t.Fatal("download length/content mismatch")
++	}
++	large := []byte(strings.Repeat("x", service.RequestLogPreviewMaxBytes()+1))
++	if err := db.Exec(`UPDATE user_prompts SET text_gzip=?,original_bytes=?`, zip(large), len(large)).Error; err != nil {
++		t.Fatal(err)
++	}
++	preview, err = svc.GetUsageEventRequestLog(context.Background(), event.ID)
++	if err != nil || !preview.TooLarge || preview.Previewable {
++		t.Fatalf("oversized preview: %+v, %v", preview, err)
++	}
++	if err := db.Exec(`UPDATE request_payloads SET body_gzip=?`, []byte("broken gzip")).Error; err != nil {
++		t.Fatal(err)
++	}
++	if _, err := svc.GetUsageEventRequestLog(context.Background(), event.ID); err == nil {
++		t.Fatal("corruption must be reported")
++	}
++}
 diff --git a/internal/service/test/usage_output_speed_test.go b/internal/service/test/usage_output_speed_test.go
 new file mode 100644
 index 0000000..5d5413d
@@ -633,6 +948,18 @@ index 391f250..a1a9d55 100644
                  </div>
                );
              })}
+diff --git a/web/src/components/usage/RequestEventsDetailsCard.tsx b/web/src/components/usage/RequestEventsDetailsCard.tsx
+index b005c41..20a89d3 100644
+--- a/web/src/components/usage/RequestEventsDetailsCard.tsx
++++ b/web/src/components/usage/RequestEventsDetailsCard.tsx
+@@ -138,6 +138,7 @@ const REQUEST_LOG_SECTION_TITLE_KEYS: Record<string, string> = {
+   RESPONSE: 'usage_stats.request_events_log_section_response',
+   'WEBSOCKET TIMELINE': 'usage_stats.request_events_log_section_websocket_timeline',
+   'API WEBSOCKET TIMELINE': 'usage_stats.request_events_log_section_api_websocket_timeline',
++  'USER PROMPTS': 'usage_stats.request_events_log_section_user_prompts',
+   'RAW LOG': 'usage_stats.request_events_log_section_raw_log',
+ };
+ 
 diff --git a/web/src/components/usage/analysis/AnalysisPanel.tsx b/web/src/components/usage/analysis/AnalysisPanel.tsx
 index 151094c..918eff2 100644
 --- a/web/src/components/usage/analysis/AnalysisPanel.tsx
@@ -1365,7 +1692,7 @@ index 0000000..d4bdab5
 +  return { accounts, byAccount, names, error, reload };
 +}
 diff --git a/web/src/i18n/index.ts b/web/src/i18n/index.ts
-index d0de019..f46d6c3 100644
+index d0de019..3ff6bd9 100644
 --- a/web/src/i18n/index.ts
 +++ b/web/src/i18n/index.ts
 @@ -43,7 +43,7 @@ const resources = {
@@ -1377,7 +1704,15 @@ index d0de019..f46d6c3 100644
          login_subtitle: 'Every flow leaves a trace.',
          console_kicker: 'Access control',
          console_title: 'Choose your console',
-@@ -790,7 +790,7 @@ const resources = {
+@@ -275,6 +275,7 @@ const resources = {
+         request_events_log_copy_failed_section: 'Unable to copy {{section}}',
+         request_events_log_section: 'Section',
+         request_events_log_section_request_info: 'Request Info',
++        request_events_log_section_user_prompts: 'User Prompts',
+         request_events_log_section_headers: 'Headers',
+         request_events_log_section_api_request: 'API Request',
+         request_events_log_section_api_response: 'API Response',
+@@ -790,7 +791,7 @@ const resources = {
          no_requests: '暂无请求'
        },
        auth: {
@@ -1386,7 +1721,15 @@ index d0de019..f46d6c3 100644
          login_subtitle: '万千流转，皆有迹可循。',
          console_kicker: '访问控制',
          console_title: '选择访问方式',
-@@ -1537,7 +1537,7 @@ const resources = {
+@@ -1022,6 +1023,7 @@ const resources = {
+         request_events_log_copy_failed_section: '无法复制{{section}}',
+         request_events_log_section: '日志段落',
+         request_events_log_section_request_info: '请求信息',
++        request_events_log_section_user_prompts: '用户提示词',
+         request_events_log_section_headers: '请求头',
+         request_events_log_section_api_request: 'API 请求',
+         request_events_log_section_api_response: 'API 响应',
+@@ -1537,7 +1539,7 @@ const resources = {
          no_requests: '尚無請求'
        },
        auth: {
@@ -1395,6 +1738,14 @@ index d0de019..f46d6c3 100644
          login_subtitle: '萬千流轉，皆有跡可循。',
          console_kicker: '存取控制',
          console_title: '選擇存取方式',
+@@ -1769,6 +1771,7 @@ const resources = {
+         request_events_log_copy_failed_section: '無法複製{{section}}',
+         request_events_log_section: '日誌段落',
+         request_events_log_section_request_info: '請求資訊',
++        request_events_log_section_user_prompts: '使用者提示詞',
+         request_events_log_section_headers: '請求標頭',
+         request_events_log_section_api_request: 'API 請求',
+         request_events_log_section_api_response: 'API 回應',
 diff --git a/web/src/lib/api.ts b/web/src/lib/api.ts
 index 07064a7..274f16f 100644
 --- a/web/src/lib/api.ts

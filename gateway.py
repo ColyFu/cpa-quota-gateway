@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 from failover import ProFailoverGate
 from routing import AccountRouter, RoutingUnavailable, session_identity
+from request_store import RequestStore
 import unified
 
 try:
@@ -70,7 +71,7 @@ def float_env(name, default):
     try: return float(env(name, str(default)))
     except ValueError: return default
 
-DB_PATH = env("QUOTA_DB", str(BASE_DIR / "data" / "quota.db"))
+DB_PATH = env("QUOTA_DB", str(BASE_DIR / "data" / ("app.db" if env('UNIFIED_CONSOLE') == '1' else "quota.db")))
 UPSTREAM = env("UPSTREAM_URL", "http://127.0.0.1:8317")
 UPSTREAM_HEADER_RETRY_ATTEMPTS = max(-1, int_env("UPSTREAM_HEADER_RETRY_ATTEMPTS", 2))
 # A zero timeout/budget means that a successful long-running Codex turn is
@@ -111,7 +112,8 @@ UPSTREAM_LARGE_REQUEST_RETRY_BUDGET_SECONDS = max(
 RETRYABLE_UPSTREAM_STATUSES = frozenset((500, 502, 503, 504))
 SHUTDOWN_EVENT = threading.Event()
 KEEPER_URL = env("KEEPER_URL", "http://127.0.0.1:8318")
-KEEPER_DB = env("KEEPER_DB", str(BASE_DIR.parent / "cpa-usage-keeper" / "data" / "app.db"))
+KEEPER_DB = env("KEEPER_DB", DB_PATH if env('UNIFIED_CONSOLE') == '1' else str(BASE_DIR.parent / "cpa-usage-keeper" / "data" / "app.db"))
+REQUEST_RECORDING_ENABLED = env('REQUEST_RECORDING_ENABLED', '0') == '1'
 KEEPER_PASSWORD = env("KEEPER_LOGIN_PASSWORD", env("LOGIN_PASSWORD"))
 CPA_MANAGEMENT_KEY = env("CPA_MANAGEMENT_KEY")
 CPA_CONFIG_PATH = env("CPA_CONFIG_PATH", str(BASE_DIR.parent / "cli-proxy-api" / "config.yaml"))
@@ -668,8 +670,15 @@ def db():
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA busy_timeout=5000")
     return c
+
+REQUEST_STORE = RequestStore(db)
+
 def init_db():
     c = db(); c.executescript(SCHEMA)
+    if REQUEST_RECORDING_ENABLED:
+        if not env('QUOTA_ROUTING_TOKEN'):
+            raise RuntimeError('request recording requires QUOTA_ROUTING_TOKEN')
+        REQUEST_STORE.initialize()
     columns={row['name'] for row in c.execute('PRAGMA table_info(policies)')}
     migrations={
         'cycle_months':"ALTER TABLE policies ADD COLUMN cycle_months INTEGER NOT NULL DEFAULT 1",
@@ -1076,6 +1085,10 @@ def sync_keeper_usage(force=False):
         KEEPER_USAGE_SYNC_LOCK.release()
 
 class Gateway(BaseHTTPRequestHandler):
+    def send_response(self, code, message=None):
+        self.record_http_status = code
+        super().send_response(code, message)
+
     protocol_version='HTTP/1.1'
     def log_message(self, fmt,*args): print(f"{self.client_address[0]} {fmt%args}", file=sys.stderr)
     def auth_key(self):
@@ -1320,13 +1333,23 @@ class Gateway(BaseHTTPRequestHandler):
             json_response(self,401,{'error':{'message':'invalid API key','type':'authentication_error','code':'invalid_api_key'}}); return
         if not policy['enabled']:
             json_response(self,403,{'error':{'message':'API key disabled','type':'permission_error'}}); return
+        record_id = None
+        if REQUEST_RECORDING_ENABLED and body:
+            try:
+                record_id = REQUEST_STORE.begin(policy['key_hash'], policy['alias'], model, self.path.split('?',1)[0], body, session_identity(self.headers, body))
+            except Exception as exc:
+                print(f'request recording unavailable: {type(exc).__name__}', file=sys.stderr)
+                json_response(self,503,{'error':{'message':'request storage unavailable','type':'server_error'}}); return
         fingerprint, explicit_request_id = request_fingerprint(key, self.command, self.path, body, self.headers)
         track_state, attempts_used = REQUEST_ATTEMPTS.begin(fingerprint, explicit_request_id, UPSTREAM_MAX_ATTEMPTS_PER_REQUEST)
         if track_state != 'ok':
             self.reject_duplicate(track_state, fingerprint, attempts_used)
+            if record_id:
+                REQUEST_STORE.finish(record_id, getattr(self, 'record_http_status', None), 'duplicate')
             return
         client_request = ClientRequest(getattr(self, 'connection', None))
         client_request.alias = policy['alias']
+        client_request.record_id = record_id
         client_request.model = model
         client_request.route_account = bool(body)
         client_request.session_hash = session_identity(self.headers, body)
@@ -1347,6 +1370,12 @@ class Gateway(BaseHTTPRequestHandler):
                 UPSTREAM_QUEUE.release(policy['key_hash'], client_request)
             with ACTIVE_REQUESTS_LOCK:
                 ACTIVE_REQUESTS.pop(id(client_request), None)
+            if record_id:
+                outcome = 'completed' if client_request.completed else ('cancelled' if client_request.cancelled.is_set() else 'failed')
+                try:
+                    REQUEST_STORE.finish(record_id, getattr(self, 'record_http_status', None), outcome)
+                except Exception as exc:
+                    print(f'request completion recording failed: {type(exc).__name__}', file=sys.stderr)
 
     def reject_duplicate(self, track_state, fingerprint, attempts_used):
         request_tag = fingerprint[:16]
@@ -1422,7 +1451,7 @@ class Gateway(BaseHTTPRequestHandler):
         response_bytes=0; stream_error=None
         try:
             target=urlsplit(UPSTREAM); path=self.path
-            hdr={k:v for k,v in self.headers.items() if k.lower() not in ('host','content-length','connection','x-quota-auth-id','x-quota-routing-token')}; hdr['Host']=target.netloc; hdr['Content-Length']=str(len(body)); hdr['X-Forwarded-For']=self.client_address[0]
+            hdr={k:v for k,v in self.headers.items() if k.lower() not in ('host','content-length','connection','x-quota-auth-id','x-quota-routing-token','x-quota-request-id')}; hdr['Host']=target.netloc; hdr['Content-Length']=str(len(body)); hdr['X-Forwarded-For']=self.client_address[0]
             if getattr(client_request, 'account_id', ''):
                 hdr['X-Quota-Auth-ID'] = client_request.account_id
                 hdr['X-Quota-Routing-Token'] = env('QUOTA_ROUTING_TOKEN')
@@ -1468,6 +1497,9 @@ class Gateway(BaseHTTPRequestHandler):
                 conn=http.client.HTTPConnection(target.hostname,target.port or 80,timeout=attempt_timeout)
                 client_request.upstream = conn
                 try:
+                    if getattr(client_request, 'record_id', None):
+                        hdr['X-Quota-Request-ID'] = REQUEST_STORE.attempt(client_request.record_id)
+                        hdr['X-Quota-Routing-Token'] = env('QUOTA_ROUTING_TOKEN')
                     conn.request(self.command,path,body=body,headers=hdr)
                     resp=conn.getresponse()
                     client_request.response = resp

@@ -1,17 +1,16 @@
 {
   "gateway": {
-    "commit": "86272d16cc513f2e05cad17ab845b58eeb8ac719",
-    "branch": "keeper-integration",
-    "dirty": false
+    "source": "repository root",
+    "branch": "keeper-integration"
   },
   "keeper": {
-    "commit": "f762f62d85b293fac5a49c1dffc481d266dbc2ea",
+    "commit": "b4851935adb1957a5eb0e01fa2af06c2d446807b",
     "branch": "gateway-integration",
     "dirty": false,
     "upstream_base": "d62cad3f345ae574089a14a4ac75cca023c7ead6"
   },
   "cpa-reference": {
-    "commit": "362d89a2e88c864af1aed754a5621bb08e1735af",
+    "commit": "42f2c4e593b4e014fc30420ce489248078f3c48b",
     "branch": "gateway-account-routing",
     "dirty": false,
     "upstream_base": "091ff27f31285ec4fd1dd5823b44f7f51fb8f48b"

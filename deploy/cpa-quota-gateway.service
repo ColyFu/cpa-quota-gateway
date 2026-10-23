@@ -1,0 +1,35 @@
+[Unit]
+Description=CPA Quota Gateway
+Wants=network-online.target cli-proxy-api.service cpa-quota-analytics.service
+After=network-online.target cli-proxy-api.service cpa-quota-analytics.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/cpa-stack/cpa-quota-gateway
+EnvironmentFile=/home/ubuntu/cpa-stack/cpa-quota-gateway/analytics.env
+EnvironmentFile=/home/ubuntu/cpa-stack/cpa-quota-gateway/gateway.env
+Environment=QUOTA_DB=/home/ubuntu/cpa-stack/cpa-quota-gateway/data/app.db
+Environment=KEEPER_DB=/home/ubuntu/cpa-stack/cpa-quota-gateway/data/app.db
+Environment=REQUEST_RECORDING_ENABLED=1
+UMask=0077
+ExecStart=/usr/bin/python3 /home/ubuntu/cpa-stack/cpa-quota-gateway/gateway.py
+Restart=always
+RestartSec=5s
+# Retry loops stop on SIGTERM. Keep a final safety bound so a blocked upstream
+# socket can never leave the gateway unavailable during restart.
+TimeoutStopSec=30s
+LimitNOFILE=524288
+TasksMax=infinity
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/cpa-stack/cpa-quota-gateway/data
+# ProFailoverGate atomically replaces CPA's config after the delayed
+# failover window; the directory must be writable for mkstemp + os.replace.
+ReadWritePaths=/home/ubuntu/cpa-stack/cli-proxy-api
+
+[Install]
+WantedBy=multi-user.target

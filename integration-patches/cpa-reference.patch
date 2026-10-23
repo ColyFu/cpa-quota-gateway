@@ -1,19 +1,55 @@
-From 362d89a2e88c864af1aed754a5621bb08e1735af Mon Sep 17 00:00:00 2001
-From: Codex <codex@local>
-Date: Fri, 23 Oct 2026 11:42:18 +0800
-Subject: [PATCH] Accept authenticated Gateway account pins before request
- logging
-
----
- internal/api/server.go                 |  2 +
- internal/api/server_routes.go          |  1 +
- sdk/api/handlers/handlers.go           |  5 ++
- sdk/api/handlers/quota_gateway.go      | 41 ++++++++++++
- sdk/api/handlers/quota_gateway_test.go | 90 ++++++++++++++++++++++++++
- 5 files changed, 139 insertions(+)
- create mode 100644 sdk/api/handlers/quota_gateway.go
- create mode 100644 sdk/api/handlers/quota_gateway_test.go
-
+diff --git a/internal/api/middleware/request_logging.go b/internal/api/middleware/request_logging.go
+index f5120a9..f31736f 100644
+--- a/internal/api/middleware/request_logging.go
++++ b/internal/api/middleware/request_logging.go
+@@ -30,7 +30,7 @@ const (
+ // large and unknown-size bodies are spooled to disk and retained only for error logs.
+ func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
+ 	return func(c *gin.Context) {
+-		if logger == nil {
++		if logger == nil || c.GetBool("quotaGatewayPromptOnly") {
+ 			c.Next()
+ 			return
+ 		}
+diff --git a/internal/api/middleware/request_logging_test.go b/internal/api/middleware/request_logging_test.go
+index 6fd9c89..ac721f7 100644
+--- a/internal/api/middleware/request_logging_test.go
++++ b/internal/api/middleware/request_logging_test.go
+@@ -714,3 +714,34 @@ func TestRequestLoggingMiddleware_StreamingPreservesFullUUIDForLogger(t *testing
+ 		t.Fatalf("streaming request ID version = %d, want 7", parsed.Version())
+ 	}
+ }
++
++func TestRequestLoggingMiddlewareSkipsTrustedGatewayTranscripts(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	dir := t.TempDir()
++	logger := logging.NewFileRequestLogger(true, dir, dir, 5)
++	router := gin.New()
++	router.Use(func(c *gin.Context) { c.Set("quotaGatewayPromptOnly", true); c.Next() })
++	router.Use(RequestLoggingMiddleware(logger))
++	body := strings.Repeat("private system and assistant transcript", 5000)
++	router.POST("/v1/responses", func(c *gin.Context) {
++		got, err := io.ReadAll(c.Request.Body)
++		if err != nil || string(got) != body {
++			t.Fatal("forwarded body changed")
++		}
++		c.JSON(500, gin.H{"error": "synthetic failure"})
++	})
++	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
++	request.Header.Set("Content-Type", "application/json")
++	response := httptest.NewRecorder()
++	router.ServeHTTP(response, request)
++	if response.Code != 500 {
++		t.Fatal("response changed")
++	}
++	files, err := os.ReadDir(dir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(files) != 0 {
++		t.Fatal("trusted Gateway request created transcript files")
++	}
++}
 diff --git a/internal/api/server.go b/internal/api/server.go
 index 454c255..909ca5c 100644
 --- a/internal/api/server.go
@@ -39,6 +75,21 @@ index 5c482f1..fe7f4a9 100644
  	s.engine.HEAD("/healthz", healthzHandler)
  
  	s.engine.GET("/management.html", s.serveManagementControlPanel)
+diff --git a/internal/logging/gin_logger.go b/internal/logging/gin_logger.go
+index a63d418..4ae03d7 100644
+--- a/internal/logging/gin_logger.go
++++ b/internal/logging/gin_logger.go
+@@ -59,6 +59,10 @@ func GinLogrusLogger() gin.HandlerFunc {
+ 		}
+ 
+ 		c.Next()
++		// Trusted gateway middleware may assign the shared request identifier.
++		if assigned := GetGinRequestID(c); assigned != "" {
++			requestID = assigned
++		}
+ 
+ 		// Keep failed health probes visible, including responses from global middleware.
+ 		if path == "/healthz" && (c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead) &&
 diff --git a/sdk/api/handlers/handlers.go b/sdk/api/handlers/handlers.go
 index 61604ee..d0beb67 100644
 --- a/sdk/api/handlers/handlers.go
@@ -57,10 +108,10 @@ index 61604ee..d0beb67 100644
  	if c != nil && c.Request != nil {
 diff --git a/sdk/api/handlers/quota_gateway.go b/sdk/api/handlers/quota_gateway.go
 new file mode 100644
-index 0000000..9feb21c
+index 0000000..eca2a00
 --- /dev/null
 +++ b/sdk/api/handlers/quota_gateway.go
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,60 @@
 +package handlers
 +
 +import (
@@ -70,6 +121,8 @@ index 0000000..9feb21c
 +	"strings"
 +
 +	"github.com/gin-gonic/gin"
++	"github.com/google/uuid"
++	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 +)
 +
 +// QuotaGatewayRouting authenticates the optional credential pin before execution.
@@ -77,12 +130,29 @@ index 0000000..9feb21c
 +func QuotaGatewayRouting() gin.HandlerFunc {
 +	return func(c *gin.Context) {
 +		id := strings.TrimSpace(c.GetHeader("X-Quota-Auth-ID"))
++		requestID := strings.TrimSpace(c.GetHeader("X-Quota-Request-ID"))
 +		token := c.GetHeader("X-Quota-Routing-Token")
 +		c.Request.Header.Del("X-Quota-Auth-ID")
 +		c.Request.Header.Del("X-Quota-Routing-Token")
++		c.Request.Header.Del("X-Quota-Request-ID")
 +		expected := os.Getenv("QUOTA_ROUTING_TOKEN")
 +		verified := expected != "" && subtle.ConstantTimeCompare([]byte(token), []byte(expected)) == 1
 +		c.Set("quotaGatewayAuthenticated", verified)
++		if requestID != "" {
++			if !verified {
++				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "invalid quota recording credential"})
++				return
++			}
++			parsed, err := uuid.Parse(requestID)
++			if err != nil || parsed.String() != requestID {
++				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "invalid quota request id"})
++				return
++			}
++			logging.SetGinRequestID(c, requestID)
++			c.Request = c.Request.WithContext(logging.WithRequestID(c.Request.Context(), requestID))
++			// Gateway retains user prompts and usage; do not spool full transcripts.
++			c.Set("quotaGatewayPromptOnly", true)
++		}
 +		if id != "" {
 +			if !verified {
 +				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "invalid quota routing credential"})
@@ -100,14 +170,14 @@ index 0000000..9feb21c
 +		c.AbortWithStatus(http.StatusForbidden)
 +		return
 +	}
-+	c.JSON(http.StatusOK, gin.H{"credential_pinning": true, "version": 1})
++	c.JSON(http.StatusOK, gin.H{"credential_pinning": true, "request_recording": true, "prompt_only_logs": true, "version": 3})
 +}
 diff --git a/sdk/api/handlers/quota_gateway_test.go b/sdk/api/handlers/quota_gateway_test.go
 new file mode 100644
-index 0000000..b0dc7b3
+index 0000000..5c6f2ba
 --- /dev/null
 +++ b/sdk/api/handlers/quota_gateway_test.go
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,122 @@
 +package handlers
 +
 +import (
@@ -116,10 +186,42 @@ index 0000000..b0dc7b3
 +	"testing"
 +
 +	"github.com/gin-gonic/gin"
++	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 +	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 +	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 +	"golang.org/x/net/context"
 +)
++
++func TestQuotaGatewayRequestRecordingUsesAuthenticatedID(t *testing.T) {
++	t.Setenv("QUOTA_ROUTING_TOKEN", "secret")
++	const id = "12345678-1234-4234-8234-123456789012"
++	for _, tc := range []struct {
++		token, id string
++		status    int
++	}{
++		{"secret", id, 200}, {"", id, 403}, {"wrong", id, 403}, {"secret", "not-a-uuid", 400},
++	} {
++		router := gin.New()
++		router.Use(logging.GinLogrusLogger(), QuotaGatewayRouting())
++		router.POST("/v1/responses", func(c *gin.Context) {
++			if logging.GetGinRequestID(c) != id || logging.GetRequestID(c.Request.Context()) != id {
++				t.Error("request ID did not reach execution context")
++			}
++			if c.GetHeader("X-Quota-Request-ID") != "" || c.GetHeader("X-Quota-Routing-Token") != "" {
++				t.Error("private headers leaked downstream")
++			}
++			c.Status(200)
++		})
++		req := httptest.NewRequest("POST", "/v1/responses", nil)
++		req.Header.Set("X-Quota-Request-ID", tc.id)
++		req.Header.Set("X-Quota-Routing-Token", tc.token)
++		response := httptest.NewRecorder()
++		router.ServeHTTP(response, req)
++		if response.Code != tc.status {
++			t.Fatalf("status=%d, want %d", response.Code, tc.status)
++		}
++	}
++}
 +
 +func TestQuotaGatewayAuthenticatedPinReachesExecutorMetadata(t *testing.T) {
 +	gin.SetMode(gin.TestMode)
@@ -198,6 +300,3 @@ index 0000000..b0dc7b3
 +		}
 +	}
 +}
--- 
-2.43.0
-

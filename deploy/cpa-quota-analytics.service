@@ -1,0 +1,28 @@
+[Unit]
+Description=CPA Quota Gateway analytics backend
+Wants=network-online.target cli-proxy-api.service
+After=network-online.target cli-proxy-api.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/cpa-stack/cpa-quota-gateway
+Environment=HTTP_PROXY=http://127.0.0.1:7890
+Environment=HTTPS_PROXY=http://127.0.0.1:7890
+Environment=ALL_PROXY=socks5://127.0.0.1:7891
+Environment=NO_PROXY=localhost,127.0.0.1,::1
+EnvironmentFile=/home/ubuntu/cpa-stack/cpa-quota-gateway/analytics.env
+ExecStart=/home/ubuntu/cpa-stack/cpa-quota-gateway/bin/analytics --env /home/ubuntu/cpa-stack/cpa-quota-gateway/analytics.env
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/cpa-stack/cpa-quota-gateway/data
+
+[Install]
+WantedBy=multi-user.target

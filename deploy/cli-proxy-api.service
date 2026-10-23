@@ -1,0 +1,22 @@
+[Unit]
+Description=CLIProxyAPI
+Documentation=https://github.com/router-for-me/CLIProxyAPI
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/cpa-stack/cli-proxy-api
+Environment=HOME=/home/ubuntu
+ExecStart=/home/ubuntu/cpa-stack/cli-proxy-api/cli-proxy-api --config /home/ubuntu/cpa-stack/cli-proxy-api/config.yaml
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+

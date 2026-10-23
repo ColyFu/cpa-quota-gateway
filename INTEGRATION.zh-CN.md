@@ -1,5 +1,7 @@
 # Keeper 与 CPA Quota Gateway 整合版
 
+**当前部署以 [目录与数据存储说明](DEPLOYMENT.zh-CN.md) 为准。** 统计后端已迁入 Gateway 目录，使用同一 SQLite 数据库，仅保存去重后的用户提示词。本文后续的备份路径属于早期实施记录，相关回退文件已按用户要求删除。
+
 开发日期：2026-10-23。开发根目录：`/home/ubuntu/cpa-integration-dev`。
 
 本版本保留 Gateway 原有队列、计费和故障恢复改动；Keeper 基于 v1.14.4，CPA 基于 v8.0.24。更新前基线已提交为 `2408701`，整合版位于 `keeper-integration` 分支。2026-10-23 已按用户要求切换生产服务，沿用现有配置与数据库；账号调度默认关闭。
