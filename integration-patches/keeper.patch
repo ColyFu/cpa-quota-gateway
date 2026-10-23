@@ -1,8 +1,8 @@
 diff --git a/internal/api/router.go b/internal/api/router.go
-index 45ae622..5b6b92b 100644
+index 45ae622..e189b8b 100644
 --- a/internal/api/router.go
 +++ b/internal/api/router.go
-@@ -122,18 +122,22 @@ func NewRouter(
+@@ -122,18 +122,23 @@ func NewRouter(
  	adminProtected := apiV1.Group("")
  	adminProtected.Use(authHandler.adminMiddleware())
  	registerStatusRoutes(adminProtected, statusProvider, statusConfig)
@@ -13,6 +13,7 @@ index 45ae622..5b6b92b 100644
  	registerUsageOverviewRoute(adminProtected, usageProvider, cpaAPIKeyProvider)
  	registerUsageActivityRoute(adminProtected, usageProvider)
  	registerUsageAnalysisRoute(adminProtected, usageProvider, cpaAPIKeyProvider)
++	registerUsageOutputSpeedRoute(adminProtected, usageProvider)
  	registerUsageEventsRoute(adminProtected, usageProvider, usageIdentityProvider, cpaAPIKeyProvider, requestLogProvider, requestLogDownloadTokens, statusConfig.CPARequestLogAccessEnabled)
  	registerUsageIdentityRoutes(adminProtected, usageIdentityProvider)
  	registerAuthFileManagementRoutes(adminProtected, authFilesProvider)
@@ -28,7 +29,7 @@ index 45ae622..5b6b92b 100644
  		rankinghttpapi.RegisterRoutes(adminProtected, rankingProvider)
  	}
  	if localRankingProvider != nil {
-@@ -327,7 +331,7 @@ func registerVersionRoutes(router gin.IRoutes) {
+@@ -327,7 +332,7 @@ func registerVersionRoutes(router gin.IRoutes) {
  func buildVersionResponse() versionResponse {
  	return versionResponse{
  		Version:            version.Version,
@@ -37,6 +38,92 @@ index 45ae622..5b6b92b 100644
  	}
  }
  
+diff --git a/internal/api/test/usage_output_speed_test.go b/internal/api/test/usage_output_speed_test.go
+new file mode 100644
+index 0000000..15c3066
+--- /dev/null
++++ b/internal/api/test/usage_output_speed_test.go
+@@ -0,0 +1,44 @@
++package test
++
++import (
++	"context"
++	. "cpa-usage-keeper/internal/api"
++	repodto "cpa-usage-keeper/internal/repository/dto"
++	dto "cpa-usage-keeper/internal/service/dto"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++)
++
++type outputSpeedStub struct {
++	analysisSplitStub
++	filter dto.UsageFilter
++	calls  int
++}
++
++func (s *outputSpeedStub) GetAnalysisOutputSpeed(_ context.Context, filter dto.UsageFilter) (*repodto.AnalysisOutputSpeed, error) {
++	s.filter = filter
++	s.calls++
++	return &repodto.AnalysisOutputSpeed{Models: []repodto.ModelOutputSpeed{}}, nil
++}
++func TestOutputSpeedRouteSharesAnalysisScopeAndAuthentication(t *testing.T) {
++	provider := &outputSpeedStub{}
++	router := NewRouter(nil, nil, provider, nil, AuthConfig{}, nil, "")
++	response := httptest.NewRecorder()
++	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/usage/analysis/output-speed?range=24h&api_key_id=12", nil))
++	if response.Code != 200 || !strings.Contains(response.Body.String(), `"models":[]`) || provider.filter.APIKeyID != "12" || provider.filter.StartTime == nil || provider.calls != 1 {
++		t.Fatalf("invalid scope/status: %d %+v %s", response.Code, provider.filter, response.Body.String())
++	}
++	response = httptest.NewRecorder()
++	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/usage/analysis/output-speed?range=invalid", nil))
++	if response.Code != 400 || provider.calls != 1 {
++		t.Fatalf("invalid range reached provider: %d", response.Code)
++	}
++	router = NewRouter(nil, nil, provider, nil, AuthConfig{Enabled: true}, nil, "")
++	response = httptest.NewRecorder()
++	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/usage/analysis/output-speed?range=24h", nil))
++	if response.Code != 401 || provider.calls != 1 {
++		t.Fatalf("unauthenticated request reached provider: %d", response.Code)
++	}
++}
+diff --git a/internal/api/usage_output_speed.go b/internal/api/usage_output_speed.go
+new file mode 100644
+index 0000000..096a003
+--- /dev/null
++++ b/internal/api/usage_output_speed.go
+@@ -0,0 +1,30 @@
++package api
++
++import (
++	"cpa-usage-keeper/internal/service"
++	"cpa-usage-keeper/internal/timeutil"
++	"github.com/gin-gonic/gin"
++	"net/http"
++	"time"
++)
++
++func registerUsageOutputSpeedRoute(router gin.IRoutes, usageProvider service.UsageProvider) {
++	router.GET("/usage/analysis/output-speed", func(c *gin.Context) {
++		filter, err := parseUsageAnalysisTimeFilterQuery(c.Request, timeutil.NormalizeStorageTime(time.Now()))
++		if err != nil {
++			writeUsageFilterParseError(c, err)
++			return
++		}
++		provider, ok := usageProvider.(service.AnalysisOutputSpeedProvider)
++		if !ok {
++			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "model output speed unavailable"})
++			return
++		}
++		result, err := provider.GetAnalysisOutputSpeed(c.Request.Context(), filter)
++		if err != nil {
++			writeInternalError(c, "get model output speed failed", err)
++			return
++		}
++		c.JSON(http.StatusOK, result)
++	})
++}
 diff --git a/internal/app/app.go b/internal/app/app.go
 index 264fb1f..5a78b44 100644
 --- a/internal/app/app.go
@@ -132,6 +219,341 @@ index 0000000..af9e845
 +		}
 +	}
 +}
+diff --git a/internal/repository/dto/output_speed.go b/internal/repository/dto/output_speed.go
+new file mode 100644
+index 0000000..8029e07
+--- /dev/null
++++ b/internal/repository/dto/output_speed.go
+@@ -0,0 +1,22 @@
++package dto
++
++import "time"
++
++// Output speed is weighted by measured generation time, never by request count.
++type ModelOutputSpeed struct {
++	Model         string     `json:"model"`
++	AverageTPS    *float64   `json:"average_tps"`
++	SampleCount   int64      `json:"sample_count"`
++	ExcludedCount int64      `json:"excluded_count"`
++	Points        []*float64 `json:"points"`
++	Samples       []int64    `json:"samples"`
++}
++
++type AnalysisOutputSpeed struct {
++	Granularity AnalysisGranularity `json:"granularity"`
++	Timezone    string              `json:"timezone"`
++	RangeStart  time.Time           `json:"range_start"`
++	RangeEnd    time.Time           `json:"range_end"`
++	Buckets     []time.Time         `json:"buckets"`
++	Models      []ModelOutputSpeed  `json:"models"`
++}
+diff --git a/internal/repository/test/usage_analysis_output_speed_test.go b/internal/repository/test/usage_analysis_output_speed_test.go
+new file mode 100644
+index 0000000..c56c43c
+--- /dev/null
++++ b/internal/repository/test/usage_analysis_output_speed_test.go
+@@ -0,0 +1,97 @@
++package test
++
++import (
++	"context"
++	"cpa-usage-keeper/internal/entities"
++	"cpa-usage-keeper/internal/repository"
++	dto "cpa-usage-keeper/internal/repository/dto"
++	"math"
++	"testing"
++	"time"
++)
++
++func TestOutputSpeedExcludesWaitingAndWeightsByGenerationTime(t *testing.T) {
++	db := openTestDatabase(t)
++	start := time.Date(2026, 10, 20, 0, 0, 0, 0, time.Local)
++	end := start.Add(3 * time.Hour)
++	if err := db.Create(&[]entities.CPAAPIKey{{APIKey: "a"}, {APIKey: "b"}, {APIKey: "deleted", IsDeleted: true}}).Error; err != nil {
++		t.Fatal(err)
++	}
++	ttft := int64(9000)
++	zero := int64(0)
++	negative := int64(-1)
++	rows := []entities.UsageEvent{
++		{APIGroupKey: "a", Model: " model-a ", Timestamp: start, OutputTokens: 1000, ReasoningTokens: 400, TTFTMS: &ttft, LatencyMS: 10000},
++		{APIGroupKey: "a", Model: "model-a", Timestamp: start.Add(2 * time.Hour), OutputTokens: 1000, TTFTMS: &ttft, LatencyMS: 18000},
++		{APIGroupKey: "a", Model: "model-a", Timestamp: start, OutputTokens: 1000000, TTFTMS: &ttft, LatencyMS: 10000, Failed: true},
++		{APIGroupKey: "a", Model: "model-a", Timestamp: start, OutputTokens: 1000000, LatencyMS: 10000},
++		{APIGroupKey: "a", Model: "model-a", Timestamp: start, OutputTokens: 1000000, TTFTMS: &zero, LatencyMS: 10000},
++		{APIGroupKey: "a", Model: "model-a", Timestamp: start, OutputTokens: 1000000, TTFTMS: &negative, LatencyMS: 10000},
++		{APIGroupKey: "a", Model: "model-a", Timestamp: start, OutputTokens: 1000000, TTFTMS: &ttft, LatencyMS: 9000},
++		{APIGroupKey: "a", Model: "model-a", Timestamp: start, OutputTokens: 1000000, TTFTMS: &ttft, LatencyMS: 8000},
++		{APIGroupKey: "a", Model: "model-a", Timestamp: start, OutputTokens: 0, TTFTMS: &ttft, LatencyMS: 10000},
++		{APIGroupKey: "a", Model: "no-timing", Timestamp: start, OutputTokens: 100, LatencyMS: 10000},
++		{APIGroupKey: "b", Model: "model-b", Timestamp: start, OutputTokens: 100, TTFTMS: &ttft, LatencyMS: 10000},
++		{APIGroupKey: "deleted", Model: "deleted", Timestamp: start, OutputTokens: 100, TTFTMS: &ttft, LatencyMS: 10000},
++		{APIGroupKey: "unknown-key", Model: "unknown-key", Timestamp: start, OutputTokens: 100, TTFTMS: &ttft, LatencyMS: 10000},
++		{APIGroupKey: "a", Model: "outside", Timestamp: end, OutputTokens: 100, TTFTMS: &ttft, LatencyMS: 10000},
++	}
++	if err := db.Create(&rows).Error; err != nil {
++		t.Fatal(err)
++	}
++	result, err := repository.BuildAnalysisOutputSpeedWithFilter(db, dto.UsageQueryFilter{Range: "custom", CustomUnit: "hour", StartTime: &start, EndTime: &end, APIGroupKey: "a"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(result.Models) != 2 || len(result.Buckets) != 3 {
++		t.Fatalf("unexpected result %+v", result)
++	}
++	model := result.Models[0]
++	if model.Model != "model-a" || model.SampleCount != 2 || model.ExcludedCount != 7 || model.AverageTPS == nil || math.Abs(*model.AverageTPS-200) > 0.0001 {
++		t.Fatalf("mean must exclude 18s waiting and use total 2000 tokens / 10s generation: %+v", model)
++	}
++	if model.Points[0] == nil || *model.Points[0] != 1000 || model.Points[1] != nil || model.Points[2] == nil || math.Abs(*model.Points[2]-1000.0/9) > 0.0001 {
++		t.Fatalf("invalid curve %+v", model.Points)
++	}
++	if result.Models[1].AverageTPS != nil || result.Models[1].SampleCount != 0 {
++		t.Fatalf("missing timing must remain null %+v", result.Models[1])
++	}
++	all, err := repository.BuildAnalysisOutputSpeedWithFilter(db, dto.UsageQueryFilter{Range: "custom", CustomUnit: "hour", StartTime: &start, EndTime: &end})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(all.Models) != 3 {
++		t.Fatalf("all-key scope should include live model-b only: %+v", all.Models)
++	}
++}
++
++func TestOutputSpeedUsesLocalDayBoundariesAndRetainedHistory(t *testing.T) {
++	db := openTestDatabase(t)
++	start := time.Date(2026, 6, 1, 0, 0, 0, 0, time.Local)
++	end := start.AddDate(0, 0, 2)
++	ttft := int64(1000)
++	if err := db.Create(&entities.CPAAPIKey{APIKey: "a"}).Error; err != nil {
++		t.Fatal(err)
++	}
++	if err := db.Create(&[]entities.UsageEvent{
++		{APIGroupKey: "a", Model: "model", Timestamp: start.Add(23 * time.Hour), OutputTokens: 100, TTFTMS: &ttft, LatencyMS: 2000},
++		{APIGroupKey: "a", Model: "model", Timestamp: start.AddDate(0, 0, 1), OutputTokens: 400, TTFTMS: &ttft, LatencyMS: 3000},
++	}).Error; err != nil {
++		t.Fatal(err)
++	}
++	result, err := repository.BuildAnalysisOutputSpeedWithFilter(db, dto.UsageQueryFilter{Range: "custom", CustomUnit: "day", StartTime: &start, EndTime: &end})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if result.Granularity != dto.AnalysisGranularityDaily || len(result.Buckets) != 2 || len(result.Models) != 1 {
++		t.Fatalf("unexpected daily result %+v", result)
++	}
++	if *result.Models[0].Points[0] != 100 || *result.Models[0].Points[1] != 200 {
++		t.Fatal("local day grouping incorrect")
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	if _, err := repository.BuildAnalysisOutputSpeedWithFilter(db.WithContext(ctx), dto.UsageQueryFilter{Range: "custom", CustomUnit: "day", StartTime: &start, EndTime: &end}); err == nil {
++		t.Fatal("cancelled request should not continue scanning")
++	}
++}
+diff --git a/internal/repository/usage_analysis_output_speed.go b/internal/repository/usage_analysis_output_speed.go
+new file mode 100644
+index 0000000..3608bcc
+--- /dev/null
++++ b/internal/repository/usage_analysis_output_speed.go
+@@ -0,0 +1,126 @@
++package repository
++
++import (
++	"fmt"
++	"sort"
++	"strings"
++	"time"
++
++	"cpa-usage-keeper/internal/entities"
++	"cpa-usage-keeper/internal/repository/dto"
++	"cpa-usage-keeper/internal/timeutil"
++	"gorm.io/gorm"
++	"gorm.io/plugin/dbresolver"
++)
++
++// BuildAnalysisOutputSpeedWithFilter reads retained events without modifying billing or rollups.
++// Invalid timing, failed requests and zero-output requests are excluded, not assigned zero speed.
++func BuildAnalysisOutputSpeedWithFilter(db *gorm.DB, filter dto.UsageQueryFilter) (*dto.AnalysisOutputSpeed, error) {
++	if db == nil || filter.StartTime == nil || filter.EndTime == nil {
++		return nil, fmt.Errorf("output speed requires database and time bounds")
++	}
++	start, end := timeutil.NormalizeStorageTime(*filter.StartTime), timeutil.NormalizeStorageTime(*filter.EndTime)
++	if !end.After(start) {
++		return nil, fmt.Errorf("output speed end must follow start")
++	}
++	daily := end.Sub(start) > 24*time.Hour
++	if filter.Range == "custom" {
++		daily = strings.TrimSpace(filter.CustomUnit) == "day"
++	}
++	step := time.Hour
++	grain := dto.AnalysisGranularityHourly
++	if daily {
++		step, grain = 24*time.Hour, dto.AnalysisGranularityDaily
++		if timeutil.IsUsageRollingDayRange(filter.Range) {
++			start, end = analysisRollingDayWindow(start, end)
++		}
++	} else {
++		start, end = usageOverviewFullHourWindow(start, end)
++		end = analysisHourlyStatsEnd(filter, end)
++	}
++	result := &dto.AnalysisOutputSpeed{Granularity: grain, Timezone: time.Local.String(), RangeStart: start, RangeEnd: end, Buckets: []time.Time{}, Models: []dto.ModelOutputSpeed{}}
++	for cursor := start; cursor.Before(end); {
++		result.Buckets = append(result.Buckets, cursor)
++		if len(result.Buckets) > 367 {
++			return nil, fmt.Errorf("output speed range exceeds supported bucket count")
++		}
++		if daily {
++			cursor = cursor.AddDate(0, 0, 1)
++		} else {
++			cursor = cursor.Add(step)
++		}
++	}
++	if len(result.Buckets) == 0 {
++		return result, nil
++	}
++	// Hour/day boundary strings are generated from the same local calendar as Analysis.
++	// A calendar date/hour substring avoids assigning DST transitions to the wrong local day.
++	// Storage timestamps are normalized to the project timezone by the shared serializer.
++	bucketLength := 13
++	if daily {
++		bucketLength = 10
++	}
++	type bucketRow struct {
++		Model    string
++		Bucket   string
++		Requests int64
++		Samples  int64
++		Output   float64
++		Elapsed  float64
++	}
++	valid := "failed = 0 AND output_tokens > 0 AND ttft_ms > 0 AND latency_ms > ttft_ms"
++	projection := fmt.Sprintf("COALESCE(NULLIF(TRIM(model), ''), 'unknown') AS model, SUBSTR(timestamp, 1, %d) AS bucket, COUNT(*) AS requests, SUM(CASE WHEN %s THEN 1 ELSE 0 END) AS samples, SUM(CASE WHEN %s THEN 1.0 * output_tokens ELSE 0 END) AS output, SUM(CASE WHEN %s THEN 1.0 * (latency_ms - ttft_ms) ELSE 0 END) AS elapsed", bucketLength, valid, valid, valid)
++	query := db.Clauses(dbresolver.Read).Model(&entities.UsageEvent{}).
++		Joins("INNER JOIN cpa_api_keys ON cpa_api_keys.api_key = usage_events.api_group_key AND cpa_api_keys.is_deleted = ?", false).
++		Where("timestamp >= ? AND timestamp < ?", timeutil.FormatStorageTime(start), timeutil.FormatStorageTime(end))
++	if key := strings.TrimSpace(filter.APIGroupKey); key != "" {
++		query = query.Where("api_group_key = ?", key)
++	}
++	var rows []bucketRow
++	if err := query.Select(projection).Group("COALESCE(NULLIF(TRIM(model), ''), 'unknown'), bucket").Scan(&rows).Error; err != nil {
++		return nil, fmt.Errorf("load model output speed: %w", err)
++	}
++	indices := map[string]int{}
++	for i, bucket := range result.Buckets {
++		indices[bucket.Format(time.RFC3339)[:bucketLength]] = i
++	}
++	type aggregate struct {
++		model           dto.ModelOutputSpeed
++		output, elapsed float64
++	}
++	models := map[string]*aggregate{}
++	for _, row := range rows {
++		index, ok := indices[row.Bucket]
++		if !ok {
++			continue
++		}
++		item := models[row.Model]
++		if item == nil {
++			item = &aggregate{model: dto.ModelOutputSpeed{Model: row.Model, Points: make([]*float64, len(result.Buckets)), Samples: make([]int64, len(result.Buckets))}}
++			models[row.Model] = item
++		}
++		item.model.SampleCount += row.Samples
++		item.model.ExcludedCount += row.Requests - row.Samples
++		item.output += row.Output
++		item.elapsed += row.Elapsed
++		item.model.Samples[index] = row.Samples
++		if row.Samples > 0 && row.Elapsed > 0 {
++			value := row.Output * 1000 / row.Elapsed
++			item.model.Points[index] = &value
++		}
++	}
++	for _, item := range models {
++		if item.elapsed > 0 {
++			value := item.output * 1000 / item.elapsed
++			item.model.AverageTPS = &value
++		}
++		result.Models = append(result.Models, item.model)
++	}
++	sort.Slice(result.Models, func(i, j int) bool {
++		if result.Models[i].SampleCount == result.Models[j].SampleCount {
++			return result.Models[i].Model < result.Models[j].Model
++		}
++		return result.Models[i].SampleCount > result.Models[j].SampleCount
++	})
++	return result, nil
++}
+diff --git a/internal/service/test/usage_output_speed_test.go b/internal/service/test/usage_output_speed_test.go
+new file mode 100644
+index 0000000..5d5413d
+--- /dev/null
++++ b/internal/service/test/usage_output_speed_test.go
+@@ -0,0 +1,38 @@
++package test
++
++import (
++	"context"
++	"cpa-usage-keeper/internal/entities"
++	"cpa-usage-keeper/internal/service"
++	dto "cpa-usage-keeper/internal/service/dto"
++	"strconv"
++	"testing"
++	"time"
++)
++
++func TestOutputSpeedResolvesAPIKeyScope(t *testing.T) {
++	db := openUsageServiceTestDatabase(t)
++	key := entities.CPAAPIKey{APIKey: "a"}
++	if err := db.Create(&key).Error; err != nil {
++		t.Fatal(err)
++	}
++	start := time.Date(2026, 10, 20, 0, 0, 0, 0, time.Local)
++	end := start.Add(time.Hour)
++	ttft := int64(1000)
++	if err := db.Create(&entities.UsageEvent{APIGroupKey: "a", Model: "model", Timestamp: start, TTFTMS: &ttft, LatencyMS: 3000, OutputTokens: 100}).Error; err != nil {
++		t.Fatal(err)
++	}
++	provider := service.NewUsageService(db, emptyPricingCatalogForTest()).(service.AnalysisOutputSpeedProvider)
++	filter := dto.UsageFilter{Range: "custom", CustomUnit: "hour", StartTime: &start, EndTime: &end, APIKeyID: strconv.FormatInt(key.ID, 10)}
++	result, err := provider.GetAnalysisOutputSpeed(context.Background(), filter)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(result.Models) != 1 || *result.Models[0].AverageTPS != 50 {
++		t.Fatalf("unexpected result %+v", result)
++	}
++	filter.APIKeyID = "invalid"
++	if _, err := provider.GetAnalysisOutputSpeed(context.Background(), filter); err == nil {
++		t.Fatal("invalid API key ID must not fall back to all users")
++	}
++}
+diff --git a/internal/service/usage_output_speed.go b/internal/service/usage_output_speed.go
+new file mode 100644
+index 0000000..7d5a322
+--- /dev/null
++++ b/internal/service/usage_output_speed.go
+@@ -0,0 +1,22 @@
++package service
++
++import (
++	"context"
++	"cpa-usage-keeper/internal/repository"
++	repodto "cpa-usage-keeper/internal/repository/dto"
++	servicedto "cpa-usage-keeper/internal/service/dto"
++)
++
++// AnalysisOutputSpeedProvider keeps the independently loaded diagnostic optional for other UsageProvider implementations.
++type AnalysisOutputSpeedProvider interface {
++	GetAnalysisOutputSpeed(context.Context, servicedto.UsageFilter) (*repodto.AnalysisOutputSpeed, error)
++}
++
++func (s *usageService) GetAnalysisOutputSpeed(ctx context.Context, filter servicedto.UsageFilter) (*repodto.AnalysisOutputSpeed, error) {
++	ctx = usageServiceContext(ctx)
++	key, err := s.resolveAPIGroupKey(ctx, filter.APIKeyID)
++	if err != nil {
++		return nil, err
++	}
++	return repository.BuildAnalysisOutputSpeedWithFilter(s.db.WithContext(ctx), repodto.UsageQueryFilter{Range: filter.Range, CustomUnit: filter.CustomUnit, StartTime: filter.StartTime, EndTime: filter.EndTime, EndExclusive: filter.EndExclusive, APIGroupKey: key})
++}
 diff --git a/web/index.html b/web/index.html
 index 8ee8e52..92abac1 100644
 --- a/web/index.html
@@ -211,6 +633,194 @@ index 391f250..a1a9d55 100644
                  </div>
                );
              })}
+diff --git a/web/src/components/usage/analysis/AnalysisPanel.tsx b/web/src/components/usage/analysis/AnalysisPanel.tsx
+index 151094c..918eff2 100644
+--- a/web/src/components/usage/analysis/AnalysisPanel.tsx
++++ b/web/src/components/usage/analysis/AnalysisPanel.tsx
+@@ -1,4 +1,4 @@
+-import { useEffect, useMemo, useState, type CSSProperties, type FocusEvent, type MouseEvent } from 'react';
++import { useEffect, useMemo, useState, type ReactNode, type CSSProperties, type FocusEvent, type MouseEvent } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import '@/lib/chartjs';
+ import { Interaction, Tooltip } from 'chart.js';
+@@ -14,6 +14,7 @@ interface AnalysisPanelProps {
+   latencyDiagnostics?: AnalysisLatencyDiagnostics | null;
+   latencyLoading?: boolean;
+   latencyError?: string;
++  outputSpeed?: ReactNode;
+   isDark: boolean;
+   isMobile: boolean;
+ }
+@@ -2388,7 +2389,7 @@ function Heatmap({ cells, apiKeys, apiKeyLabels, models, loading, isDark }: { ce
+   );
+ }
+ 
+-export function AnalysisPanel({ analysis, loading, latencyDiagnostics, latencyLoading = false, latencyError = '', isDark, isMobile }: AnalysisPanelProps) {
++export function AnalysisPanel({ analysis, loading, latencyDiagnostics, latencyLoading = false, latencyError = '', outputSpeed, isDark, isMobile }: AnalysisPanelProps) {
+   const { t } = useTranslation();
+   const tokenRows = useMemo(() => buildTokenUsageRows(analysis?.token_usage ?? [], analysis?.granularity ?? 'hourly', analysis?.timezone), [analysis]);
+   const apiComposition = useMemo(() => takeMajorComposition(analysis?.api_key_composition ?? [], t('usage_stats.analysis_others')), [analysis, t]);
+@@ -2418,7 +2419,10 @@ export function AnalysisPanel({ analysis, loading, latencyDiagnostics, latencyLo
+         isDark={isDark}
+         isMobile={isMobile}
+       />
+-      <LatencyDiagnosticsCard diagnostics={latencyDiagnostics} loading={latencyLoading} error={latencyError} isDark={isDark} isMobile={isMobile} />
++      <div className={outputSpeed ? styles.insightGrid : undefined}>
++        <LatencyDiagnosticsCard diagnostics={latencyDiagnostics} loading={latencyLoading} error={latencyError} isDark={isDark} isMobile={isMobile} />
++        {outputSpeed}
++      </div>
+       <CompositionPanel tabs={compositionTabs} loading={loading} isDark={isDark} windowMinutes={analysisWindowMinutes} />
+       <Heatmap cells={analysis?.heatmap?.cells ?? []} apiKeys={analysis?.heatmap?.api_keys ?? []} apiKeyLabels={analysis?.heatmap?.api_key_labels ?? {}} models={analysis?.heatmap?.models ?? []} loading={loading} isDark={isDark} />
+     </div>
+diff --git a/web/src/components/usage/analysis/ModelOutputSpeedCard.module.scss b/web/src/components/usage/analysis/ModelOutputSpeedCard.module.scss
+new file mode 100644
+index 0000000..2386137
+--- /dev/null
++++ b/web/src/components/usage/analysis/ModelOutputSpeedCard.module.scss
+@@ -0,0 +1,17 @@
++.card { padding: var(--keeper-card-padding); min-width: 0; min-height: 420px; border: 1px solid var(--border-color); border-radius: 20px; background: var(--bg-primary); display: flex; flex-direction: column; }
++.header { margin-bottom: 16px; h3 { margin: 0 0 6px; font-size: 17px; } p { margin: 0; font-size: 12px; color: var(--text-secondary); line-height: 1.6; } }
++.scale { color: var(--text-secondary); font-size: 10px; margin-bottom: 10px; line-height: 1.5; }
++.tableScroll { overflow: auto; max-height: 440px; min-width: 0; table { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 12px; } thead th { text-align: left; color: var(--text-secondary); font-weight: 500; padding: 8px 4px; border-bottom: 1px solid var(--border-color); } thead th:first-child { width: 30%; } thead th:last-child { width: 82px; } }
++.modelRow { th, td { padding: 12px 4px; border-bottom: 1px solid var(--border-color); } th { text-align: left; font-weight: 500; min-width: 0; strong { display: block; overflow-wrap: anywhere; font-size: 12px; } small { display: block; margin-top: 6px; color: var(--text-secondary); font-size: 10px; font-weight: 400; line-height: 1.6; } } }
++.curveCell { position: relative; svg { display: block; width: 100%; height: 56px; overflow: visible; outline-offset: 3px; } }
++.grid { fill: none; stroke: var(--border-color); stroke-width: 1; }
++.curve { fill: none; stroke: #4d8cdb; stroke-width: 2; vector-effect: non-scaling-stroke; stroke-linecap: round; stroke-linejoin: round; }
++.dot { fill: #4d8cdb; }
++.averageLine { stroke: #d49a54; stroke-width: 1; stroke-dasharray: 4 4; }
++.cursor { stroke: var(--text-secondary); stroke-width: 1; stroke-dasharray: 2 3; }
++.tooltip { position: absolute; z-index: 3; bottom: 2px; right: 0; padding: 5px 7px; border-radius: 6px; border: 1px solid var(--border-color); background: var(--bg-primary); color: var(--text-primary); box-shadow: 0 3px 8px #0002; font-size: 10px; white-space: nowrap; pointer-events: none; }
++.tableScroll .mean, .mean { text-align: right; font-variant-numeric: tabular-nums; strong { display: block; font-size: 18px; font-weight: 650; } small { color: var(--text-secondary); font-size: 10px; } }
++.range { display: flex; justify-content: space-between; margin: 9px 0 0 30%; padding-right: 82px; gap: 8px; font-size: 10px; color: var(--text-secondary); }
++.note { margin: auto 0 0; padding-top: 18px; color: var(--text-secondary); line-height: 1.7; font-size: 11px; }
++.empty { min-height: 250px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; color: var(--text-secondary); font-size: 12px; overflow-wrap: anywhere; button { background: var(--bg-secondary); border: 1px solid var(--border-color); color: var(--text-primary); padding: 7px 14px; border-radius: 8px; cursor: pointer; } }
++@media(max-width:600px) { .tableScroll thead th:last-child { width: 64px; } .modelRow th strong { font-size: 11px; } .mean strong { font-size: 16px; } .range { padding-right: 64px; } .tooltip { font-size: 9px; max-width: 200px; white-space: normal; } }
+diff --git a/web/src/components/usage/analysis/ModelOutputSpeedCard.tsx b/web/src/components/usage/analysis/ModelOutputSpeedCard.tsx
+new file mode 100644
+index 0000000..e865245
+--- /dev/null
++++ b/web/src/components/usage/analysis/ModelOutputSpeedCard.tsx
+@@ -0,0 +1,72 @@
++import { useEffect, useState } from 'react';
++import { ApiError, fetchAnalysisOutputSpeed } from '@/lib/api';
++import type { AnalysisOutputSpeed, ModelOutputSpeed, UsageRangeRequest } from '@/lib/types';
++import styles from './ModelOutputSpeedCard.module.scss';
++
++const rate = (value: number | null) => value === null ? '—' : value.toLocaleString('zh-CN', { maximumFractionDigits: 1, minimumFractionDigits: 1 });
++const xAt = (index: number, count: number) => count <= 1 ? 150 : 8 + index / (count - 1) * 284;
++const yAt = (value: number, max: number) => 48 - value / max * 40;
++export function speedCurvePath(points: (number | null)[], max: number) {
++  let connected = false;
++  return points.map((point, index) => {
++    if (point === null) { connected = false; return ''; }
++    const command = connected ? 'L' : 'M'; connected = true;
++    return `${command}${xAt(index, points.length).toFixed(2)},${yAt(point, max).toFixed(2)}`;
++  }).join(' ');
++}
++function bucketLabel(bucket: string, timezone: string, daily: boolean) {
++  const date = new Date(bucket);
++  try { return date.toLocaleString('zh-CN', { timeZone: timezone === 'Local' ? undefined : timezone, month: '2-digit', day: '2-digit', ...(daily ? {} : { hour: '2-digit', minute: '2-digit', hour12: false }) }); }
++  catch { return date.toLocaleString('zh-CN'); }
++}
++function SpeedRow({ model, data, max }: { model: ModelOutputSpeed; data: AnalysisOutputSpeed; max: number }) {
++  const [active, setActive] = useState<number | null>(null);
++  const label = active === null ? '' : `${bucketLabel(data.buckets[active], data.timezone, data.granularity === 'daily')} · ${model.points[active] === null ? '无有效样本' : `${rate(model.points[active])} token/s · ${model.samples[active]} 次请求`}`;
++  return <tr className={styles.modelRow}>
++    <th scope="row"><strong title={model.model}>{model.model}</strong><small>{model.sample_count.toLocaleString()} 次有效请求{model.excluded_count > 0 ? ` · ${model.excluded_count.toLocaleString()} 次未计入` : ''}</small></th>
++    <td className={styles.curveCell}>
++      <svg viewBox="0 0 300 56" preserveAspectRatio="none" role="img" aria-label={`${model.model} 输出速度曲线，平均 ${rate(model.average_tps)} token/s；方向键查看时段`} tabIndex={0}
++        onMouseMove={event => { const box = event.currentTarget.getBoundingClientRect(); const x = (event.clientX - box.left) / box.width * 300; setActive(Math.max(0, Math.min(model.points.length - 1, Math.round((x - 8) / 284 * (model.points.length - 1))))); }}
++        onMouseLeave={() => setActive(null)} onFocus={() => setActive(model.points.findIndex(point => point !== null) >= 0 ? model.points.findIndex(point => point !== null) : 0)} onBlur={() => setActive(null)}
++        onKeyDown={event => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); setActive(Math.min(model.points.length - 1, Math.max(0, (active ?? 0) + (event.key === 'ArrowRight' ? 1 : -1)))); } else if (event.key === 'Escape') setActive(null); }}>
++        <path d="M8,48 H292 M8,28 H292" className={styles.grid} />
++        {model.average_tps !== null && <path d={`M8,${yAt(model.average_tps, max)} H292`} className={styles.averageLine} />}
++        <path d={speedCurvePath(model.points, max)} className={styles.curve} />
++        {model.points.map((point, index) => point === null ? null : <circle key={index} cx={xAt(index, model.points.length)} cy={yAt(point, max)} r={model.points.length > 48 ? 1.5 : 2.5} className={styles.dot} />)}
++        {active !== null && <path d={`M${xAt(active, model.points.length)},6 V50`} className={styles.cursor} />}
++      </svg>
++      {active !== null && <span className={styles.tooltip} role="status">{label}</span>}
++    </td>
++    <td className={styles.mean}><strong>{rate(model.average_tps)}</strong><small>{model.average_tps === null ? '无有效计时' : 'token/s'}</small></td>
++  </tr>;
++}
++export function ModelOutputSpeedCard({ request, apiKeyId, refreshKey = 0, onAuthRequired }: { request?: UsageRangeRequest; apiKeyId?: string; refreshKey?: number; onAuthRequired?: () => void }) {
++  const [result, setResult] = useState<{ key: string; data: AnalysisOutputSpeed | null; error: string }>({ key: '', data: null, error: '' });
++  const [retry, setRetry] = useState(0);
++  const query = JSON.stringify(request);
++  const requestKey = JSON.stringify([query, apiKeyId, refreshKey, retry]);
++  const current = Boolean(query) && result.key === requestKey;
++  const data = current ? result.data : null;
++  const error = current ? result.error : '';
++  const loading = Boolean(query) && !current;
++  useEffect(() => {
++    if (!query) return;
++    const controller = new AbortController();
++    void fetchAnalysisOutputSpeed(JSON.parse(query) as UsageRangeRequest, controller.signal, apiKeyId)
++      .then(response => { if (!controller.signal.aborted) setResult({ key: requestKey, data: response, error: '' }); })
++      .catch((e: Error) => { if (!controller.signal.aborted) { if (e instanceof ApiError && e.status === 401) onAuthRequired?.(); setResult({ key: requestKey, data: null, error: e.message }); } });
++    return () => controller.abort();
++  }, [query, apiKeyId, requestKey, onAuthRequired]);
++  let maximum = 0;
++  for (const model of data?.models ?? []) for (const point of model.points) if (point !== null) maximum = Math.max(maximum, point);
++  const max = Math.max(10, Math.ceil(maximum / 10) * 10);
++  return <section className={styles.card} aria-label="模型输出速度">
++    <div className={styles.header}><h3>模型输出速度</h3><p>从首字开始计时，随页面的 API Key 和范围筛选。</p></div>
++    {loading ? <div className={styles.empty} role="status">正在统计输出速度…</div> : error ? <div className={styles.empty} role="alert"><span>{error}</span><button onClick={() => setRetry(value => value + 1)}>重试</button></div> : !data?.models.length ? <div className={styles.empty}>所选范围暂无请求记录</div> : <>
++      <div className={styles.scale}>曲线共用纵轴：0–{max.toLocaleString()} token/s · 虚线为该模型平均速度</div>
++      <div className={styles.tableScroll}><table><thead><tr><th>模型</th><th>速度曲线（{data.granularity === 'daily' ? '按天' : '按小时'}）</th><th className={styles.mean}>平均速度</th></tr></thead><tbody>{data.models.map(model => <SpeedRow key={model.model} model={model} data={data} max={max} />)}</tbody></table></div>
++      {data.buckets.length > 0 && <div className={styles.range}><span>{bucketLabel(data.buckets[0], data.timezone, data.granularity === 'daily')}</span><span>{bucketLabel(data.buckets[data.buckets.length - 1], data.timezone, data.granularity === 'daily')}</span></div>}
++    </>}
++    <p className={styles.note}>平均速度 = 有效请求总输出 Token ÷ 总输出耗时；输出耗时 = 总耗时 − 首字等待。Token 含推理，基于已保留的请求记录；失败、无输出或计时无效的请求不计入，曲线空档表示无有效样本。</p>
++  </section>;
++}
+diff --git a/web/src/components/usage/analysis/test/ModelOutputSpeedCard.test.tsx b/web/src/components/usage/analysis/test/ModelOutputSpeedCard.test.tsx
+new file mode 100644
+index 0000000..bdfb991
+--- /dev/null
++++ b/web/src/components/usage/analysis/test/ModelOutputSpeedCard.test.tsx
+@@ -0,0 +1,42 @@
++// @vitest-environment happy-dom
++import { act } from 'react';
++import { createRoot, type Root } from 'react-dom/client';
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
++import { ModelOutputSpeedCard, speedCurvePath } from '../ModelOutputSpeedCard';
++import { fetchAnalysisOutputSpeed } from '@/lib/api';
++import type { AnalysisOutputSpeed } from '@/lib/types';
++vi.mock('@/lib/api',()=>({fetchAnalysisOutputSpeed:vi.fn(),ApiError:class extends Error{status=401;}}));
++globalThis.IS_REACT_ACT_ENVIRONMENT=true;
++const payload:AnalysisOutputSpeed={granularity:'hourly',timezone:'Asia/Shanghai',range_start:'2026-10-23T10:00:00+08:00',range_end:'2026-10-23T13:00:00+08:00',buckets:['2026-10-23T10:00:00+08:00','2026-10-23T11:00:00+08:00','2026-10-23T12:00:00+08:00'],models:[{model:'model-a',average_tps:200,sample_count:2,excluded_count:3,points:[1000,null,1000/9],samples:[1,0,1]},{model:'no-timing',average_tps:null,sample_count:0,excluded_count:2,points:[null,null,null],samples:[0,0,0]}]};
++describe('model output speed',()=>{
++ let container:HTMLDivElement;let root:Root;
++ beforeEach(()=>{vi.clearAllMocks();container=document.createElement('div');document.body.appendChild(container);root=createRoot(container);vi.mocked(fetchAnalysisOutputSpeed).mockResolvedValue(payload);});
++ afterEach(async()=>{await act(async()=>root.unmount());container.remove();});
++ it('shows one row per model, server-weighted mean and missing timing without inventing zero speed',async()=>{
++  await act(async()=>root.render(<ModelOutputSpeedCard request={{range:'24h'}} apiKeyId="12" />));
++  expect(container.querySelectorAll('tbody tr')).toHaveLength(2);expect(container.querySelector('tbody')?.textContent).toContain('200.0');expect(container.querySelector('tbody')?.textContent).toContain('无有效计时');
++  expect(fetchAnalysisOutputSpeed).toHaveBeenCalledWith({range:'24h'},expect.any(AbortSignal),'12');
++  expect(container.textContent).toContain('总耗时 − 首字等待');
++ });
++ it('keeps gaps in the curve and shows one sample as a dot rather than a fabricated line',()=>{
++  expect(speedCurvePath([100,null,200],200).match(/M/g)).toHaveLength(2);expect(speedCurvePath([100,null,200],200)).not.toContain('L');expect(speedCurvePath([100],200)).toBe('M150.00,28.00');
++ });
++ it('aborts the previous filter request and ignores its late response',async()=>{
++  let resolveOld!:(value:AnalysisOutputSpeed)=>void;
++  vi.mocked(fetchAnalysisOutputSpeed).mockImplementationOnce(()=>new Promise(resolve=>{resolveOld=resolve;})).mockResolvedValueOnce({...payload,models:[]});
++  await act(async()=>root.render(<ModelOutputSpeedCard request={{range:'24h'}} apiKeyId="old" />));
++  const signal=vi.mocked(fetchAnalysisOutputSpeed).mock.calls[0][1];
++  await act(async()=>root.render(<ModelOutputSpeedCard request={{range:'7d'}} apiKeyId="new" />));
++  expect(signal?.aborted).toBe(true);await act(async()=>resolveOld(payload));expect(container.textContent).toContain('暂无请求记录');expect(container.querySelectorAll('tbody tr')).toHaveLength(0);
++ });
++ it('supports independent retry and clears results for an invalid date range',async()=>{
++  vi.mocked(fetchAnalysisOutputSpeed).mockRejectedValueOnce(new Error('网络中断')).mockResolvedValueOnce(payload);
++  await act(async()=>root.render(<ModelOutputSpeedCard request={{range:'24h'}} />));expect(container.querySelector('[role=alert]')?.textContent).toContain('网络中断');
++  await act(async()=>{(container.querySelector('button') as HTMLButtonElement).click();});expect(container.querySelectorAll('tbody tr')).toHaveLength(2);
++  await act(async()=>root.render(<ModelOutputSpeedCard />));expect(container.querySelectorAll('tbody tr')).toHaveLength(0);
++ });
++ it('reloads when the page refreshes without changing its selected scope',async()=>{
++  await act(async()=>root.render(<ModelOutputSpeedCard request={{range:'24h'}} apiKeyId="12" refreshKey={1} />));
++  await act(async()=>root.render(<ModelOutputSpeedCard request={{range:'24h'}} apiKeyId="12" refreshKey={2} />));expect(fetchAnalysisOutputSpeed).toHaveBeenCalledTimes(2);
++ });
++});
 diff --git a/web/src/components/usage/credentials/useCredentialsTabData.ts b/web/src/components/usage/credentials/useCredentialsTabData.ts
 index be2e44d..cd0fd12 100644
 --- a/web/src/components/usage/credentials/useCredentialsTabData.ts
@@ -339,7 +949,7 @@ index 0000000..24cdb70
 +}
 diff --git a/web/src/features/gateway/LocalRankingPanel.tsx b/web/src/features/gateway/LocalRankingPanel.tsx
 new file mode 100644
-index 0000000..2eed54d
+index 0000000..dc0a265
 --- /dev/null
 +++ b/web/src/features/gateway/LocalRankingPanel.tsx
 @@ -0,0 +1,16 @@
@@ -352,7 +962,7 @@ index 0000000..2eed54d
 +  const [period, setPeriod] = useState<RankingPeriod>('today');
 +  const [metric, setMetric] = useState<RankingMetric>('overall');
 +  const data = useLocalRankingData({ enabled: true, period, metric, onAuthRequired });
-+  return <section aria-label="本地排名"><h2 style={{fontSize:18, marginBottom:16}}>本地排名</h2><RankingPage scope="local" period={period} metric={metric} status={null} metadata={null}
++  return <section aria-label="本地排名" style={{marginTop:24}}><h2 style={{fontSize:18, marginBottom:16}}>本地排名</h2><p style={{fontSize:12,color:'var(--text-secondary)',marginBottom:16}}>本地排名使用下方的独立筛选，不受页面右上角 API Key 和范围影响。</p><RankingPage scope="local" period={period} metric={metric} status={null} metadata={null}
 +    leaderboard={data.leaderboard} leaderboardLoading={data.leaderboardLoading} leaderboardError={data.leaderboardError}
 +    statusLoading={false} metadataLoading={false} statusError={null} metadataError={null} action={null} actionError={null}
 +    onClearActionError={() => {}} onJoin={noop} onSync={noop} onPause={noop} onResume={noop} onExit={noop}
@@ -785,8 +1395,65 @@ index d0de019..f46d6c3 100644
          login_subtitle: '萬千流轉，皆有跡可循。',
          console_kicker: '存取控制',
          console_title: '選擇存取方式',
+diff --git a/web/src/lib/api.ts b/web/src/lib/api.ts
+index 07064a7..274f16f 100644
+--- a/web/src/lib/api.ts
++++ b/web/src/lib/api.ts
+@@ -1,4 +1,4 @@
+-import { type AnalysisLatencyDiagnostics, type AnalysisResponse, type AuthFilesManagementResponse, type AuthManagedSessionsResponse, type AuthSessionResponse, type CpaApiKeyDisplayItem, type CpaApiKeyOptionsResponse, type CpaApiKeySettingsResponse, type CpaApiKeysResponse, type OverviewRealtimeBlock, type OverviewRealtimeWindow, type PricingEntry, type PricingResponse, type PricingRulesResponse, type PricingSyncPreviewResponse, type QuotaAutoRefreshSettings, type ReplacePricingRulesRequest, type StatusResponse, type UpdateCheckResponse, type UsageActivityRequest, type UsageActivityResponse, type UsageEventModelFilterOptionsResponse, type UsageEventRequestLogResponse, type UsageEventSourceFilterOptionsResponse, type UsageRangeRequest, type UsedModelsResponse, type UsageIdentitiesPageResponse, type UsageIdentitiesResponse, type UsageEventsResponse, type UsageIdentity, type UsageIdentityAuthType, type UsageOverviewResponse, type UsageQuotaCacheResponse, type UsageQuotaInspectionStatusResponse, type UsageQuotaRefreshResponse, type UsageQuotaRefreshTaskResponse, type UsageQuotaResetCreditsResponse, type UsageQuotaResetResponse, type VersionResponse } from './types'
++import { type AnalysisOutputSpeed, type AnalysisLatencyDiagnostics, type AnalysisResponse, type AuthFilesManagementResponse, type AuthManagedSessionsResponse, type AuthSessionResponse, type CpaApiKeyDisplayItem, type CpaApiKeyOptionsResponse, type CpaApiKeySettingsResponse, type CpaApiKeysResponse, type OverviewRealtimeBlock, type OverviewRealtimeWindow, type PricingEntry, type PricingResponse, type PricingRulesResponse, type PricingSyncPreviewResponse, type QuotaAutoRefreshSettings, type ReplacePricingRulesRequest, type StatusResponse, type UpdateCheckResponse, type UsageActivityRequest, type UsageActivityResponse, type UsageEventModelFilterOptionsResponse, type UsageEventRequestLogResponse, type UsageEventSourceFilterOptionsResponse, type UsageRangeRequest, type UsedModelsResponse, type UsageIdentitiesPageResponse, type UsageIdentitiesResponse, type UsageEventsResponse, type UsageIdentity, type UsageIdentityAuthType, type UsageOverviewResponse, type UsageQuotaCacheResponse, type UsageQuotaInspectionStatusResponse, type UsageQuotaRefreshResponse, type UsageQuotaRefreshTaskResponse, type UsageQuotaResetCreditsResponse, type UsageQuotaResetResponse, type VersionResponse } from './types'
+ import { isCPAMCEmbed } from '@/embed/cpamcEmbed'
+ import { resolveUsageRequestRange } from '@/utils/usage/rangeQuery'
+ 
+@@ -722,6 +722,20 @@ export async function fetchAnalysisLatency(request: UsageRangeRequest, signal?:
+   return response.json()
+ }
+ 
++export async function fetchAnalysisOutputSpeed(request: UsageRangeRequest, signal?: AbortSignal, apiKeyId?: string): Promise<AnalysisOutputSpeed> {
++  const params = buildUsageRangeParams(request)
++  const selectedAPIKeyId = apiKeyId?.trim()
++  if (selectedAPIKeyId) {
++    params.set('api_key_id', selectedAPIKeyId)
++  }
++  const query = params.toString()
++  const response = await apiFetch(`${apiPath('/usage/analysis/output-speed')}${query ? `?${query}` : ''}`, { signal })
++  if (!response.ok) {
++    await parseApiError(response, `Failed to load model output speed: ${response.status}`)
++  }
++  return response.json()
++}
++
+ export async function fetchCpaApiKeyOptions(signal?: AbortSignal): Promise<CpaApiKeyOptionsResponse> {
+   const response = await apiFetch(apiPath('/usage/api-keys/options'), { signal, cache: 'no-store' })
+   if (!response.ok) {
+diff --git a/web/src/lib/types.ts b/web/src/lib/types.ts
+index 4296e1d..1ba063a 100644
+--- a/web/src/lib/types.ts
++++ b/web/src/lib/types.ts
+@@ -794,3 +794,21 @@ export interface UsageFilterWindow {
+   endMs?: number
+   windowMinutes?: number
+ }
++
++export interface ModelOutputSpeed {
++  model: string
++  average_tps: number | null
++  sample_count: number
++  excluded_count: number
++  points: (number | null)[]
++  samples: number[]
++}
++
++export interface AnalysisOutputSpeed {
++  granularity: 'hourly' | 'daily'
++  timezone: string
++  range_start: string
++  range_end: string
++  buckets: string[]
++  models: ModelOutputSpeed[]
++}
 diff --git a/web/src/pages/UsagePage.tsx b/web/src/pages/UsagePage.tsx
-index 58c4cf5..e11c46e 100644
+index 58c4cf5..f298a2f 100644
 --- a/web/src/pages/UsagePage.tsx
 +++ b/web/src/pages/UsagePage.tsx
 @@ -1,7 +1,7 @@
@@ -808,7 +1475,7 @@ index 58c4cf5..e11c46e 100644
    PriceSettingsCard,
    AuthFileCredentialsSection,
    AiProviderCredentialsSection,
-@@ -44,13 +42,10 @@ import { getDailyAverageCardUsage, isDailyAverageRange } from '@/utils/usage/ove
+@@ -44,13 +42,11 @@ import { getDailyAverageCardUsage, isDailyAverageRange } from '@/utils/usage/ove
  import type { Theme } from '@/types';
  import { BrandLink } from '@/components/BrandLink';
  import { isCPAMCEmbed } from '@/embed/cpamcEmbed';
@@ -822,11 +1489,12 @@ index 58c4cf5..e11c46e 100644
 +import { QueuePools } from '@/features/gateway/QueuePools';
 +import { AccountRouting } from '@/features/gateway/AccountRouting';
 +import { UserQuotaSettings } from '@/features/gateway/UserQuotaSettings';
++import { ModelOutputSpeedCard } from '@/components/usage/analysis/ModelOutputSpeedCard';
 +import { LocalRankingPanel } from '@/features/gateway/LocalRankingPanel';
  import styles from './UsagePage.module.scss';
  
  const TIME_RANGE_STORAGE_KEY = 'cli-proxy-usage-time-range-v1';
-@@ -65,8 +60,6 @@ const THEME_OPTIONS: ReadonlyArray<{ value: Theme; labelKey: string }> = [
+@@ -65,8 +61,6 @@ const THEME_OPTIONS: ReadonlyArray<{ value: Theme; labelKey: string }> = [
    { value: 'auto', labelKey: 'usage_stats.theme_auto' }
  ];
  const USAGE_TAB_OPTIONS = ['overview', 'analysis', 'ranking', 'events', 'auth-files', 'ai-provider', 'settings'] as const;
@@ -835,7 +1503,7 @@ index 58c4cf5..e11c46e 100644
  type UsageTab = (typeof USAGE_TAB_OPTIONS)[number];
  type Translate = (key: string) => string;
  const USAGE_TAB_LABEL_KEYS: Record<UsageTab, string> = {
-@@ -785,9 +778,9 @@ export const normalizeUsageTabValue = (value: unknown): UsageTab | null => {
+@@ -785,9 +779,9 @@ export const normalizeUsageTabValue = (value: unknown): UsageTab | null => {
  
  export const getUsageTabOptions = (
    translate: Translate,
@@ -847,7 +1515,7 @@ index 58c4cf5..e11c46e 100644
      value,
      label: translate(USAGE_TAB_LABEL_KEYS[value]),
    }));
-@@ -851,13 +844,9 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -851,13 +845,9 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
    const isDark = resolvedTheme === 'dark';
    const [activeTab, setActiveTab] = useState<UsageTab>(() => {
      const loadedTab = loadUsageTab();
@@ -863,7 +1531,7 @@ index 58c4cf5..e11c46e 100644
    const [loadedTimeRange] = useState(loadTimeRange);
    const pendingLegacyCustomRangeRef = useRef(loadedTimeRange.pendingLegacyCustomRange);
    const [timeRangeState, setTimeRangeState] = useState<StoredUsageRangeState>(loadedTimeRange.state);
-@@ -866,7 +855,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -866,7 +856,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
    const [selectedApiKeyId, setSelectedApiKeyId] = useState('');
    const [apiKeyOptions, setApiKeyOptions] = useState<CpaApiKeyOption[]>([]);
    const [status, setStatus] = useState<StatusResponse | null>(null);
@@ -872,7 +1540,7 @@ index 58c4cf5..e11c46e 100644
    const apiKeyOptionsRequestControllerRef = useRef<AbortController | null>(null);
    const credentialSectionVisibility = getCredentialSectionVisibility(activeTab);
    const activeCustomRange = useMemo(() => getUsageCustomRangeForTab(activeTab, customRange, {
-@@ -976,15 +965,8 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -976,15 +966,8 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
    const [apiKeySettingsError, setApiKeySettingsError] = useState('');
    const [apiKeySettingsSavingId, setApiKeySettingsSavingId] = useState<string | null>(null);
    const apiKeySettingsRequestControllerRef = useRef<AbortController | null>(null);
@@ -888,7 +1556,7 @@ index 58c4cf5..e11c46e 100644
    const [loggingOut, setLoggingOut] = useState(false);
    const [logoutConfirmOpen, setLogoutConfirmOpen] = useState(false);
    const topNoticeTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
-@@ -1026,45 +1008,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -1026,45 +1009,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
        topNoticeTimerRef.current = null;
      }, getUpdateCheckToastDuration(kind));
    }, []);
@@ -934,7 +1602,15 @@ index 58c4cf5..e11c46e 100644
    const credentialsData = useCredentialsTabData({
      enabledAuthFiles: credentialSectionVisibility.showAuthFiles && pageVisible,
      enabledAiProviders: credentialSectionVisibility.showAiProvider && pageVisible,
-@@ -1112,7 +1055,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -1073,6 +1017,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+   });
+   const refreshCredentials = credentialsData.refresh;
+   const [analysisLoading, setAnalysisLoading] = useState(false);
++  const [analysisSpeedRevision, setAnalysisSpeedRevision] = useState(0);
+   const [analysisError, setAnalysisError] = useState('');
+   const [analysisData, setAnalysisData] = useState<AnalysisResponse | null>(null);
+   const [analysisLatencyLoading, setAnalysisLatencyLoading] = useState(false);
+@@ -1112,7 +1057,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
      if (topNotice.kind === 'success') return styles.updateCheckToastSuccess;
      return styles.updateCheckToastInfo;
    })() : '';
@@ -942,7 +1618,7 @@ index 58c4cf5..e11c46e 100644
  
    const loadApiKeyOptions = useCallback(async () => {
      apiKeyOptionsRequestControllerRef.current?.abort();
-@@ -1174,39 +1116,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -1174,39 +1118,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
      }
    }, [onAuthRequired]);
  
@@ -982,7 +1658,7 @@ index 58c4cf5..e11c46e 100644
    const handleSaveApiKeyAlias = useCallback(async (id: string, keyAlias: string) => {
      setApiKeySettingsSavingId(id);
      setApiKeySettingsError('');
-@@ -1214,45 +1123,19 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -1214,45 +1125,19 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
        const updated = await updateCpaApiKeyAlias(id, keyAlias);
        setApiKeySettings((current) => current.map((item) => (item.id === updated.id ? { ...item, ...updated } : item)));
        setApiKeyOptions((current) => current.map((item) => (item.id === updated.id ? updated : item)));
@@ -1030,7 +1706,15 @@ index 58c4cf5..e11c46e 100644
  
    const loadAnalysis = useCallback(async () => {
      if (!usageRangeQuery.valid) return;
-@@ -1435,11 +1318,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -1261,6 +1146,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+     analysisRequestControllerRef.current = controller;
+ 
+     setAnalysisLoading(true);
++    setAnalysisSpeedRevision(value => value + 1);
+     setAnalysisError('');
+     setAnalysisData(null);
+     setAnalysisLatencyLoading(true);
+@@ -1435,11 +1321,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
      }
    }, [apiKeyOptions, selectedApiKeyId]);
  
@@ -1043,7 +1727,7 @@ index 58c4cf5..e11c46e 100644
  
    useEffect(() => () => {
      if (topNoticeTimerRef.current !== null) {
-@@ -1656,10 +1535,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -1656,10 +1538,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
        await Promise.all([loadEventFilterOptions(), loadEvents()]);
        return;
      }
@@ -1055,7 +1739,7 @@ index 58c4cf5..e11c46e 100644
      if (credentialSectionVisibility.enabled) {
        await refreshCredentials();
        return;
-@@ -1669,11 +1545,11 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -1669,11 +1548,11 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
        return;
      }
      if (activeTab === 'settings') {
@@ -1069,7 +1753,7 @@ index 58c4cf5..e11c46e 100644
  
    const refreshAutoRefreshTab = useCallback(async () => {
      if (activeTab === 'events') {
-@@ -1732,34 +1608,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -1732,34 +1611,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
      }
    }, [onAuthRequired]);
  
@@ -1104,7 +1788,7 @@ index 58c4cf5..e11c46e 100644
    useEffect(() => scheduleOverviewAutoRefresh({
      enabled: autoRefreshEnabled,
      refreshOverview: refreshAutoRefreshTab,
-@@ -1826,20 +1674,14 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -1826,20 +1677,14 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
        apiKeySettingsRequestControllerRef.current?.abort();
        apiKeySettingsRequestControllerRef.current = null;
        setApiKeySettingsLoading(false);
@@ -1126,7 +1810,7 @@ index 58c4cf5..e11c46e 100644
  
    useEffect(() => {
      const next = sanitizeRequestEventFilters(
-@@ -1877,7 +1719,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -1877,7 +1722,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
      : '';
    // 只有需要时间范围的 tab 才渲染 Range 控件，避免 Credentials/Pricing 产生空白占位。
    const showRangeControls = shouldShowRangeControls(activeTab);
@@ -1134,7 +1818,7 @@ index 58c4cf5..e11c46e 100644
    const {
      requestsSparkline,
      tokensSparkline,
-@@ -1922,30 +1763,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -1922,30 +1766,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
                  );
                })}
              </div>
@@ -1165,7 +1849,7 @@ index 58c4cf5..e11c46e 100644
              <MainActionButton
                type="button"
                aria-label={t('common.logout')}
-@@ -1969,27 +1786,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -1969,27 +1789,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
                </div>
              )}
  
@@ -1193,7 +1877,7 @@ index 58c4cf5..e11c46e 100644
  
              {topNotice && (
                <div
-@@ -2072,17 +1868,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -2072,17 +1871,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
                      </div>
                    </div>
                    )}
@@ -1211,7 +1895,7 @@ index 58c4cf5..e11c46e 100644
                  </div>
                  <div className={styles.usageRefreshSlot}>
                    <div className={styles.usageFilterActions}>
-@@ -2108,9 +1893,8 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -2108,9 +1896,8 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
  
              {activeTab === 'overview' && error && <div className={styles.errorBox}>{error === 'AUTH_REQUIRED' ? t('auth.session_expired') : error}</div>}
              {activeTab === 'settings' && pricingError && <div className={styles.errorBox}>{pricingError === 'AUTH_REQUIRED' ? t('auth.session_expired') : pricingError}</div>}
@@ -1222,15 +1906,15 @@ index 58c4cf5..e11c46e 100644
  
              {activeTab === 'overview' && (
                <>
-@@ -2154,6 +1938,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
- 
-             {activeTab === 'analysis' && (
-               <>
+@@ -2161,46 +1948,17 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+                   latencyDiagnostics={analysisLatencyData}
+                   latencyLoading={analysisLatencyLoading}
+                   latencyError={analysisLatencyError}
++                  outputSpeed={<ModelOutputSpeedCard request={usageRangeQuery.valid ? usageRangeQuery : undefined} apiKeyId={selectedApiKeyId} refreshKey={analysisSpeedRevision} onAuthRequired={onAuthRequired} />}
+                   isDark={isDark}
+                   isMobile={isMobile}
+                 />
 +                <LocalRankingPanel onAuthRequired={onAuthRequired} />
-                 {analysisError && <div className={styles.errorBox}>{analysisError}</div>}
-                 <AnalysisPanel
-                   analysis={analysisData}
-@@ -2167,40 +1952,9 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
                </>
              )}
  
@@ -1272,7 +1956,7 @@ index 58c4cf5..e11c46e 100644
                  {eventsError && <div className={styles.errorBox}>{eventsError}</div>}
                  <RequestEventsDetailsCard
                    events={eventsData}
-@@ -2240,6 +1994,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -2240,6 +1998,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
  
              {credentialSectionVisibility.enabled && (
                <>
@@ -1280,7 +1964,7 @@ index 58c4cf5..e11c46e 100644
                  {credentialsData.error && <div className={styles.errorBox}>{credentialsData.error}</div>}
                  <CredentialProviderFilterBar
                    scope={activeCredentialProviderFilterScope}
-@@ -2300,13 +2055,8 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -2300,13 +2059,8 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
  
              {activeTab === 'settings' && (
                <div className={styles.settingsSections}>
