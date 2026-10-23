@@ -173,8 +173,10 @@ class RequestStore:
         with closing(self.connect()) as conn:
             conn.execute('BEGIN IMMEDIATE')
             try:
-                ids = store_texts(conn, facts['prompts'])
+                ids = prompt_ids(facts['prompts'])
                 refs, status, detail, state = detect_input(load_state(conn, conversation), ids, facts, bool(session_hash))
+                retained = set(refs)
+                store_texts(conn, [text for identity, text in zip(ids, facts['prompts']) if identity in retained])
                 payload_id = store_references(conn, refs)
                 save_state(conn, conversation, state)
                 conn.execute('INSERT INTO request_records(id,key_hash,user_alias,received_at,model,endpoint,payload_id,conversation_hash,input_state,input_detail,new_input_count) VALUES(?,?,?,?,?,?,?,?,?,?,?)',

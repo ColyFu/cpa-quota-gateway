@@ -1,10 +1,12 @@
 """Same-origin Keeper console and Gateway administration bridge."""
 import copy
+import retention
 import hashlib
 import json
 import mimetypes
 import threading
 import time
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import unquote, urlsplit
@@ -150,14 +152,19 @@ def payload(h):
 
 
 def admin_route(h, g, path):
-    if path not in ('/admin/queue', '/admin/routing', '/admin/accounts', '/admin/key-links', '/admin/preference'):
+    if path not in ('/admin/queue', '/admin/routing', '/admin/accounts', '/admin/key-links', '/admin/preference', '/admin/history-retention'):
         return False
-    if h.command not in ('GET', 'PUT') or (h.command == 'PUT' and path not in ('/admin/routing', '/admin/preference')):
+    if h.command not in ('GET', 'PUT') or (h.command == 'PUT' and path not in ('/admin/routing', '/admin/preference', '/admin/history-retention')):
         g.json_response(h, 405, {'error': 'method not allowed'})
         return True
     router = g.UPSTREAM_QUEUE.router
     try:
-        if path == '/admin/queue':
+        if path == '/admin/history-retention':
+            with closing(g.db()) as conn:
+                if h.command == 'PUT':
+                    retention.save_days(conn, payload(h).get('days'))
+                g.json_response(h, 200, retention.status(conn))
+        elif path == '/admin/queue':
             g.json_response(h, 200, g.UPSTREAM_QUEUE.detailed_snapshot())
         elif path == '/admin/accounts':
             g.json_response(h, 200, {'accounts': cpa_accounts(g)})

@@ -149,11 +149,22 @@ class RoutingTests(unittest.TestCase):
 
     def test_admin_endpoints_reject_unauthorized_and_missing_csrf(self):
         port=self.serve()
-        for path in ('/admin/routing','/admin/queue','/admin/accounts','/admin/key-links'):
+        for path in ('/admin/routing','/admin/queue','/admin/accounts','/admin/key-links','/admin/history-retention'):
             self.assertEqual(self.call(port,path)[0],401)
         headers={'X-Quota-Admin-Token':g.ADMIN_TOKEN}
         self.assertEqual(self.call(port,'/admin/routing','PUT',self.config,headers)[0],403)
         self.assertEqual(self.call(port,'/admin/queue',headers=headers)[0],200)
+
+    def test_history_retention_setting_is_admin_only_validated_and_persistent(self):
+        port=self.serve();path='/admin/history-retention';headers={'X-Quota-Admin-Token':g.ADMIN_TOKEN}
+        status,body=self.call(port,path,headers=headers)
+        self.assertEqual(status,200);self.assertEqual(body['days'],60)
+        self.assertEqual(self.call(port,path,'PUT',{'days':30},headers)[0],403)
+        headers['X-Quota-Admin-Request']='1'
+        for value in [0,-1,1.5,True,'30',3651]:
+            self.assertEqual(self.call(port,path,'PUT',{'days':value},headers)[0],400)
+        self.assertEqual(self.call(port,path,'PUT',{'days':120},headers)[1]['days'],120)
+        self.assertEqual(self.call(port,path,headers=headers)[1]['days'],120)
 
     def test_preference_updates_one_user_without_overwriting_other_preferences(self):
         port=self.serve();headers={'X-Quota-Admin-Token':g.ADMIN_TOKEN,'X-Quota-Admin-Request':'1'}

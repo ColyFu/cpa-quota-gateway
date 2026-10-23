@@ -38,6 +38,35 @@ index 45ae622..e189b8b 100644
  	}
  }
  
+diff --git a/internal/api/test/usage_events_test.go b/internal/api/test/usage_events_test.go
+index f905932..2f4d673 100644
+--- a/internal/api/test/usage_events_test.go
++++ b/internal/api/test/usage_events_test.go
+@@ -260,13 +260,13 @@ func TestUsageEventsEndpointsAcceptNinetyDayCustomRange(t *testing.T) {
+ 	}
+ }
+ 
+-func TestUsageEventsEndpointsRejectCustomRangeBeyondNinetyDays(t *testing.T) {
++func TestUsageEventsEndpointsRejectCustomRangeBeyondOneYear(t *testing.T) {
+ 	now := time.Now().In(time.Local)
+ 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local)
+ 	query := url.Values{
+ 		"range": {"custom"},
+ 		"unit":  {"day"},
+-		"start": {today.AddDate(0, 0, -90).Format(time.DateOnly)},
++		"start": {today.AddDate(0, 0, -365).Format(time.DateOnly)},
+ 		"end":   {today.Format(time.DateOnly)},
+ 	}
+ 
+@@ -286,7 +286,7 @@ func TestUsageEventsEndpointsRejectCustomRangeBeyondNinetyDays(t *testing.T) {
+ 			router.ServeHTTP(response, request)
+ 
+ 			if response.Code != http.StatusBadRequest {
+-				t.Fatalf("expected 91-day custom Events %s to return 400, got %d body=%s", tc.name, response.Code, response.Body.String())
++				t.Fatalf("expected 366-day custom Events %s to return 400, got %d body=%s", tc.name, response.Code, response.Body.String())
+ 			}
+ 			if provider.filterCalls != 0 || provider.exportCalls != 0 {
+ 				t.Fatalf("expected rejected range not to reach provider, list=%d export=%d", provider.filterCalls, provider.exportCalls)
 diff --git a/internal/api/test/usage_output_speed_test.go b/internal/api/test/usage_output_speed_test.go
 new file mode 100644
 index 0000000..15c3066
@@ -88,6 +117,143 @@ index 0000000..15c3066
 +		t.Fatalf("unauthenticated request reached provider: %d", response.Code)
 +	}
 +}
+diff --git a/internal/api/usage_events.go b/internal/api/usage_events.go
+index e3d3aaf..dc4de9d 100644
+--- a/internal/api/usage_events.go
++++ b/internal/api/usage_events.go
+@@ -40,6 +40,12 @@ type usageEventFilterOptionsResponse struct {
+ }
+ 
+ type usageEventPayload struct {
++	HasNewInput      bool     `json:"has_new_input"`
++	SummaryRequests  int64    `json:"summary_requests,omitempty"`
++	SummarySuccess   int64    `json:"summary_success,omitempty"`
++	SummaryFailure   int64    `json:"summary_failure,omitempty"`
++	AverageCacheRate *float64 `json:"average_cache_rate,omitempty"`
++
+ 	ID                  string                 `json:"id,omitempty"`
+ 	Timestamp           string                 `json:"timestamp"`
+ 	APIKey              string                 `json:"api_key,omitempty"`
+@@ -99,6 +105,10 @@ type usageEventRequestLogDownloadTokenPayload struct {
+ }
+ 
+ type usageEventExportPayload struct {
++	SummaryRequests int64 `json:"summary_requests"`
++	SummarySuccess  int64 `json:"summary_success"`
++	SummaryFailure  int64 `json:"summary_failure"`
++
+ 	ID                  string   `json:"id"`
+ 	Timestamp           string   `json:"timestamp"`
+ 	APIKey              string   `json:"api_key"`
+@@ -417,6 +427,7 @@ func buildUsageEventsPayload(rows []servicedto.UsageEventRecord, resolver usageI
+ 			id = strconv.FormatInt(row.ID, 10)
+ 		}
+ 		payload = append(payload, usageEventPayload{
++			HasNewInput: row.HasNewInput, SummaryRequests: row.SummaryRequests, SummarySuccess: row.SummarySuccess, SummaryFailure: row.SummaryFailure, AverageCacheRate: row.AverageCacheRate,
+ 			ID:                  id,
+ 			Timestamp:           timeutil.FormatStorageTime(row.Timestamp),
+ 			APIKey:              usageEventAPIKeyLabel(row.APIGroupKey, apiKeyInfos),
+@@ -500,10 +511,14 @@ func buildUsageEventExportPayload(row servicedto.UsageEventRecord, resolver usag
+ 		id = strconv.FormatInt(row.ID, 10)
+ 	}
+ 	result := "success"
++	if row.SummaryRequests > 0 {
++		result = "daily_summary"
++	}
+ 	if row.Failed {
+ 		result = "failed"
+ 	}
+ 	return usageEventExportPayload{
++		SummaryRequests: row.SummaryRequests, SummarySuccess: row.SummarySuccess, SummaryFailure: row.SummaryFailure,
+ 		ID:                  id,
+ 		Timestamp:           timeutil.FormatStorageTime(row.Timestamp),
+ 		APIKey:              usageEventAPIKeyLabel(row.APIGroupKey, apiKeyInfos),
+@@ -538,6 +553,9 @@ func buildUsageEventExportPayload(row servicedto.UsageEventRecord, resolver usag
+ }
+ 
+ func usageEventSpeedTPS(row servicedto.UsageEventRecord) *float64 {
++	if row.SummaryRequests > 0 {
++		return row.AverageSpeedTPS
++	}
+ 	if row.TTFTMS == nil || *row.TTFTMS <= 0 || row.LatencyMS <= *row.TTFTMS || row.OutputTokens <= 0 {
+ 		return nil
+ 	}
+@@ -547,6 +565,9 @@ func usageEventSpeedTPS(row servicedto.UsageEventRecord) *float64 {
+ }
+ 
+ func usageEventCacheReadRate(row servicedto.UsageEventRecord) *float64 {
++	if row.SummaryRequests > 0 {
++		return row.AverageCacheRate
++	}
+ 	if row.InputTokens <= 0 {
+ 		return nil
+ 	}
+@@ -585,6 +606,7 @@ var usageEventsExportCSVHeader = []string{
+ 	"cache_read_rate",
+ 	"total_tokens",
+ 	"cost_usd",
++	"summary_requests", "summary_success", "summary_failure",
+ }
+ 
+ func writeUsageEventsJSONExport(c *gin.Context, stream usageEventStreamFunc, resolver usageIdentityResolver, apiKeyInfos map[string]analysisAPIKeyInfo) error {
+@@ -782,6 +804,7 @@ func usageEventExportCSVRecord(event usageEventExportPayload) []string {
+ 		formatOptionalFloat64(event.CacheReadRate),
+ 		strconv.FormatInt(event.TotalTokens, 10),
+ 		strconv.FormatFloat(event.CostUSD, 'f', -1, 64),
++		strconv.FormatInt(event.SummaryRequests, 10), strconv.FormatInt(event.SummarySuccess, 10), strconv.FormatInt(event.SummaryFailure, 10),
+ 	}
+ }
+ 
+diff --git a/internal/api/usage_filter.go b/internal/api/usage_filter.go
+index 7492aec..6173a4c 100644
+--- a/internal/api/usage_filter.go
++++ b/internal/api/usage_filter.go
+@@ -21,7 +21,7 @@ var allowedUsageEventsPageSizes = map[int]struct{}{
+ 	1000: {},
+ }
+ 
+-const usageEventsCustomDayRangeMaxDays = 90
++const usageEventsCustomDayRangeMaxDays = timeutil.LongCustomDayRangeMaxDays
+ 
+ func writeUsageFilterParseError(c *gin.Context, err error) {
+ 	status := http.StatusBadRequest
+@@ -50,7 +50,7 @@ func parseKeyUsageOverviewTimeFilterQuery(req *http.Request, anchor time.Time) (
+ 	return parseUsageTimeFilterQueryWithOptions(req, anchor, false, timeutil.UsageQueryRangeOptions{MaxCustomDayRangeDays: timeutil.LongCustomDayRangeMaxDays})
+ }
+ 
+-// Events 直接查询热表原始事件，Custom 日范围与 90 天保留窗口保持一致。
++// Events combines retained detail and daily history, using the same one-year window as Analysis.
+ func parseUsageEventsTimeFilterQuery(req *http.Request, anchor time.Time) (servicedto.UsageFilter, error) {
+ 	return parseUsageTimeFilterQueryWithOptions(req, anchor, true, timeutil.UsageQueryRangeOptions{MaxCustomDayRangeDays: usageEventsCustomDayRangeMaxDays})
+ }
+diff --git a/internal/api/usage_filter_test.go b/internal/api/usage_filter_test.go
+index c3dad42..43564f0 100644
+--- a/internal/api/usage_filter_test.go
++++ b/internal/api/usage_filter_test.go
+@@ -230,7 +230,7 @@ func TestParseUsageFilterQueryRejectsInvalidCustomRange(t *testing.T) {
+ 	}
+ }
+ 
+-func TestParseUsageFilterQueryRejectsCustomDayRangeBeyondNinetyDays(t *testing.T) {
++func TestParseUsageFilterQueryRejectsCustomDayRangeBeyondOneYear(t *testing.T) {
+ 	previousLocal := time.Local
+ 	location, err := time.LoadLocation("Asia/Shanghai")
+ 	if err != nil {
+@@ -241,12 +241,12 @@ func TestParseUsageFilterQueryRejectsCustomDayRangeBeyondNinetyDays(t *testing.T
+ 	anchor := time.Date(2026, 6, 16, 9, 0, 0, 0, location)
+ 
+ 	today := time.Date(anchor.Year(), anchor.Month(), anchor.Day(), 0, 0, 0, 0, location)
+-	start := today.AddDate(0, 0, -90)
++	start := today.AddDate(0, 0, -365)
+ 	req := httptest.NewRequest("GET", "/api/v1/usage/events?range=custom&unit=day&start="+start.Format(time.DateOnly)+"&end="+today.Format(time.DateOnly), nil)
+ 
+ 	_, err = parseUsageFilterQuery(req, anchor)
+ 	if err == nil {
+-		t.Fatal("expected 91-day custom Events range to be rejected")
++		t.Fatal("expected 366-day custom Events range to be rejected")
+ 	}
+ }
+ 
 diff --git a/internal/api/usage_output_speed.go b/internal/api/usage_output_speed.go
 new file mode 100644
 index 0000000..096a003
@@ -247,6 +413,37 @@ index 0000000..8029e07
 +	Buckets     []time.Time         `json:"buckets"`
 +	Models      []ModelOutputSpeed  `json:"models"`
 +}
+diff --git a/internal/repository/dto/usage_events.go b/internal/repository/dto/usage_events.go
+index 27982c6..1c47df9 100644
+--- a/internal/repository/dto/usage_events.go
++++ b/internal/repository/dto/usage_events.go
+@@ -18,6 +18,13 @@ type UsageEventFilterOptionsRecord struct {
+ 
+ // UsageEventRecord 是单条 usage event 的查询结果。
+ type UsageEventRecord struct {
++	HasNewInput      bool
++	SummaryRequests  int64
++	SummarySuccess   int64
++	SummaryFailure   int64
++	AverageSpeedTPS  *float64
++	AverageCacheRate *float64
++
+ 	ID                  int64
+ 	Timestamp           time.Time
+ 	APIGroupKey         string
+diff --git a/internal/repository/query_projection_test.go b/internal/repository/query_projection_test.go
+index 7cf28a4..a184fef 100644
+--- a/internal/repository/query_projection_test.go
++++ b/internal/repository/query_projection_test.go
+@@ -15,7 +15,7 @@ func TestRepositoryQueriesAvoidKnownFullEntityReads(t *testing.T) {
+ 		"loadUsageOverviewRealtimeEventsWithFilter",
+ 	)
+ 	assertFileContains(t, "usage.go",
+-		"Select(usageEventProjectionColumns).Order(\"timestamp DESC, id DESC\")",
++		"Select(projection).Order(\"timestamp DESC, id DESC\")",
+ 		"Select(projection).\n\t\tOrder(\"timestamp asc\")",
+ 		"usageOverviewBoundaryEventProjectionColumns = \"api_group_key, model, model_alias, timestamp, failed, input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_creation_tokens, total_tokens\"",
+ 		"usageOverviewRealtimeEventProjectionColumns = \"api_group_key, provider, auth_type, model, model_alias, timestamp, source, auth_index, failed, generate, latency_ms, ttft_ms, input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_creation_tokens, total_tokens\"",
 diff --git a/internal/repository/test/usage_analysis_output_speed_test.go b/internal/repository/test/usage_analysis_output_speed_test.go
 new file mode 100644
 index 0000000..c56c43c
@@ -350,12 +547,117 @@ index 0000000..c56c43c
 +		t.Fatal("cancelled request should not continue scanning")
 +	}
 +}
+diff --git a/internal/repository/usage.go b/internal/repository/usage.go
+index dee22cf..fa8b633 100644
+--- a/internal/repository/usage.go
++++ b/internal/repository/usage.go
+@@ -26,6 +26,13 @@ const usageOverviewRealtimeEventProjectionColumns = "api_group_key, provider, au
+ 
+ // usageEventProjection 是 usage_events 轻量投影，专门承接 select columns 的查询结果。
+ type usageEventProjection struct {
++	HasNewInput      bool
++	SummaryRequests  int64
++	SummarySuccess   int64
++	SummaryFailure   int64
++	AverageSpeedTPS  *float64
++	AverageCacheRate *float64
++
+ 	ID                  int64
+ 	APIGroupKey         string
+ 	Provider            string
+@@ -41,7 +48,7 @@ type usageEventProjection struct {
+ 	ResponseServiceTier string
+ 	ExecutorType        string
+ 	Endpoint            string
+-	Timestamp           time.Time
++	Timestamp           time.Time `gorm:"serializer:storageTime"`
+ 	Source              string
+ 	AuthIndex           string
+ 	Failed              bool
+@@ -63,7 +70,7 @@ func ListUsageEventsWithFilter(db *gorm.DB, filter dto.UsageQueryFilter, costRes
+ 	}
+ 
+ 	// 第一步：应用列表筛选，统计分页总数。
+-	baseQuery := queryUsageEvents(db)
++	baseQuery, projection := requestHistoryQuery(db)
+ 	baseQuery = applyUsageEventListQuery(baseQuery, filter)
+ 
+ 	var totalCount int64
+@@ -90,8 +97,9 @@ func ListUsageEventsWithFilter(db *gorm.DB, filter dto.UsageQueryFilter, costRes
+ 		offset = 0
+ 	}
+ 
+-	query := applyUsageEventListQuery(db.Model(&entities.UsageEvent{}), filter)
+-	query = query.Select(usageEventProjectionColumns).Order("timestamp DESC, id DESC").Limit(pageSize).Offset(offset)
++	historyQuery, _ := requestHistoryQuery(db)
++	query := applyUsageEventListQuery(historyQuery, filter)
++	query = query.Select(projection).Order("timestamp DESC, id DESC").Limit(pageSize).Offset(offset)
+ 
+ 	rows, err := loadUsageEventRecordsForQuery(db, query, costResolver)
+ 	if err != nil {
+@@ -121,8 +129,9 @@ func StreamUsageEventsWithFilter(db *gorm.DB, filter dto.UsageQueryFilter, emit
+ 	if db == nil {
+ 		return fmt.Errorf("database is nil")
+ 	}
+-	query := applyUsageEventListQuery(db.Model(&entities.UsageEvent{}), filter)
+-	query = query.Select(usageEventProjectionColumns).Order("timestamp DESC, id DESC")
++	historyQuery, projection := requestHistoryQuery(db)
++	query := applyUsageEventListQuery(historyQuery, filter)
++	query = query.Select(projection).Order("timestamp DESC, id DESC")
+ 	return streamUsageEventRecordsForQuery(db, query, emit, costResolver)
+ }
+ 
+@@ -140,7 +149,8 @@ func ListUsageEventFilterOptionsWithFilter(db *gorm.DB, filter dto.UsageQueryFil
+ 
+ func listUsageEventModelFilterOptions(db *gorm.DB, filter dto.UsageQueryFilter) ([]string, error) {
+ 	// 第一步：model 候选值只来自 usage_events，并且只套用时间窗口。
+-	query := applyUsageEventFilterOptionsQuery(queryUsageEvents(db), filter)
++	historyQuery, _ := requestHistoryQuery(db)
++	query := applyUsageEventFilterOptionsQuery(historyQuery, filter)
+ 
+ 	// 第二步：只按 model 索引去重排序；空白值由内存兜底过滤，避免给索引扫描追加无意义条件。
+ 	var values []string
+@@ -185,9 +195,14 @@ func loadUsageEventRecordsForQuery(db *gorm.DB, query *gorm.DB, costResolver pri
+ 	for _, event := range events {
+ 		record := usageEventProjectionToRecord(event)
+ 		// Request Events cost 只在响应阶段按当前价格配置计算，不回写 usage_events。
+-		record.CostUSD, record.CostAvailable, record.PricingStyle = usageEventRecordCost(record, costResolver)
++		if record.SummaryRequests == 0 {
++			record.CostUSD, record.CostAvailable, record.PricingStyle = usageEventRecordCost(record, costResolver)
++		}
+ 		rows = append(rows, record)
+ 	}
++	if err := markNewRequestInputs(db, rows); err != nil {
++		return nil, err
++	}
+ 	return rows, nil
+ }
+ 
+@@ -208,7 +223,9 @@ func streamUsageEventRecordsForQuery(db *gorm.DB, query *gorm.DB, emit func(dto.
+ 		}
+ 		record := usageEventProjectionToRecord(event)
+ 		// Request Events cost 只在响应阶段按当前价格配置计算，不回写 usage_events。
+-		record.CostUSD, record.CostAvailable, record.PricingStyle = usageEventRecordCost(record, costResolver)
++		if record.SummaryRequests == 0 {
++			record.CostUSD, record.CostAvailable, record.PricingStyle = usageEventRecordCost(record, costResolver)
++		}
+ 		if err := emit(record); err != nil {
+ 			return err
+ 		}
+@@ -223,6 +240,7 @@ func streamUsageEventRecordsForQuery(db *gorm.DB, query *gorm.DB, emit func(dto.
+ func usageEventProjectionToRecord(event usageEventProjection) dto.UsageEventRecord {
+ 	// 对前端展示字段统一 trim，避免历史脏数据影响筛选和展示一致性。
+ 	return dto.UsageEventRecord{
++		SummaryRequests: event.SummaryRequests, SummarySuccess: event.SummarySuccess, SummaryFailure: event.SummaryFailure, AverageSpeedTPS: event.AverageSpeedTPS, AverageCacheRate: event.AverageCacheRate,
+ 		ID:          event.ID,
+ 		Timestamp:   timeutil.NormalizeStorageTime(event.Timestamp),
+ 		APIGroupKey: strings.TrimSpace(event.APIGroupKey),
 diff --git a/internal/repository/usage_analysis_output_speed.go b/internal/repository/usage_analysis_output_speed.go
 new file mode 100644
-index 0000000..3608bcc
+index 0000000..e35ab60
 --- /dev/null
 +++ b/internal/repository/usage_analysis_output_speed.go
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,146 @@
 +package repository
 +
 +import (
@@ -428,7 +730,11 @@ index 0000000..3608bcc
 +	}
 +	valid := "failed = 0 AND output_tokens > 0 AND ttft_ms > 0 AND latency_ms > ttft_ms"
 +	projection := fmt.Sprintf("COALESCE(NULLIF(TRIM(model), ''), 'unknown') AS model, SUBSTR(timestamp, 1, %d) AS bucket, COUNT(*) AS requests, SUM(CASE WHEN %s THEN 1 ELSE 0 END) AS samples, SUM(CASE WHEN %s THEN 1.0 * output_tokens ELSE 0 END) AS output, SUM(CASE WHEN %s THEN 1.0 * (latency_ms - ttft_ms) ELSE 0 END) AS elapsed", bucketLength, valid, valid, valid)
-+	query := db.Clauses(dbresolver.Read).Model(&entities.UsageEvent{}).
++	source := db.Clauses(dbresolver.Read).Model(&entities.UsageEvent{})
++	if db.Migrator().HasTable("request_daily_stats") && db.Migrator().HasTable("usage_events_archive") {
++		source = db.Clauses(dbresolver.Read).Table("(SELECT model,timestamp,api_group_key,failed,output_tokens,ttft_ms,latency_ms FROM usage_events UNION ALL SELECT model,timestamp,api_group_key,failed,output_tokens,ttft_ms,latency_ms FROM usage_events_archive) AS usage_events")
++	}
++	query := source.
 +		Joins("INNER JOIN cpa_api_keys ON cpa_api_keys.api_key = usage_events.api_group_key AND cpa_api_keys.is_deleted = ?", false).
 +		Where("timestamp >= ? AND timestamp < ?", timeutil.FormatStorageTime(start), timeutil.FormatStorageTime(end))
 +	if key := strings.TrimSpace(filter.APIGroupKey); key != "" {
@@ -438,13 +744,27 @@ index 0000000..3608bcc
 +	if err := query.Select(projection).Group("COALESCE(NULLIF(TRIM(model), ''), 'unknown'), bucket").Scan(&rows).Error; err != nil {
 +		return nil, fmt.Errorf("load model output speed: %w", err)
 +	}
++	if daily && db.Migrator().HasTable("request_daily_stats") {
++		summaryQuery := db.Clauses(dbresolver.Read).Table("request_daily_stats").
++			Joins("INNER JOIN cpa_api_keys ON cpa_api_keys.api_key=request_daily_stats.api_group_key AND cpa_api_keys.is_deleted=?", false).
++			Where("bucket_start>=? AND bucket_start<?", timeutil.FormatStorageTime(start), timeutil.FormatStorageTime(end))
++		if key := strings.TrimSpace(filter.APIGroupKey); key != "" {
++			summaryQuery = summaryQuery.Where("api_group_key=?", key)
++		}
++		var summaries []bucketRow
++		if err := summaryQuery.Select("COALESCE(NULLIF(TRIM(model), ''), 'unknown') AS model, day AS bucket, SUM(request_count) AS requests, SUM(speed_samples) AS samples, SUM(speed_output_tokens) AS output, SUM(speed_elapsed_ms) AS elapsed").Group("COALESCE(NULLIF(TRIM(model), ''), 'unknown'),day").Scan(&summaries).Error; err != nil {
++			return nil, fmt.Errorf("load historical output speed: %w", err)
++		}
++		rows = append(rows, summaries...)
++	}
 +	indices := map[string]int{}
 +	for i, bucket := range result.Buckets {
 +		indices[bucket.Format(time.RFC3339)[:bucketLength]] = i
 +	}
 +	type aggregate struct {
-+		model           dto.ModelOutputSpeed
-+		output, elapsed float64
++		model                       dto.ModelOutputSpeed
++		output, elapsed             float64
++		bucketOutput, bucketElapsed []float64
 +	}
 +	models := map[string]*aggregate{}
 +	for _, row := range rows {
@@ -454,16 +774,18 @@ index 0000000..3608bcc
 +		}
 +		item := models[row.Model]
 +		if item == nil {
-+			item = &aggregate{model: dto.ModelOutputSpeed{Model: row.Model, Points: make([]*float64, len(result.Buckets)), Samples: make([]int64, len(result.Buckets))}}
++			item = &aggregate{bucketOutput: make([]float64, len(result.Buckets)), bucketElapsed: make([]float64, len(result.Buckets)), model: dto.ModelOutputSpeed{Model: row.Model, Points: make([]*float64, len(result.Buckets)), Samples: make([]int64, len(result.Buckets))}}
 +			models[row.Model] = item
 +		}
 +		item.model.SampleCount += row.Samples
 +		item.model.ExcludedCount += row.Requests - row.Samples
 +		item.output += row.Output
 +		item.elapsed += row.Elapsed
-+		item.model.Samples[index] = row.Samples
++		item.model.Samples[index] += row.Samples
++		item.bucketOutput[index] += row.Output
++		item.bucketElapsed[index] += row.Elapsed
 +		if row.Samples > 0 && row.Elapsed > 0 {
-+			value := row.Output * 1000 / row.Elapsed
++			value := item.bucketOutput[index] * 1000 / item.bucketElapsed[index]
 +			item.model.Points[index] = &value
 +		}
 +	}
@@ -482,6 +804,220 @@ index 0000000..3608bcc
 +	})
 +	return result, nil
 +}
+diff --git a/internal/repository/usage_event_archive.go b/internal/repository/usage_event_archive.go
+index eb36781..91d0ee1 100644
+--- a/internal/repository/usage_event_archive.go
++++ b/internal/repository/usage_event_archive.go
+@@ -23,6 +23,10 @@ func ArchiveExpiredUsageEvents(ctx context.Context, db *gorm.DB, now time.Time)
+ 	if ctx == nil {
+ 		ctx = context.Background()
+ 	}
++	// Integrated Gateway owns the configurable detail retention and atomic daily compaction.
++	if db.Migrator().HasTable("request_daily_stats") {
++		return dto.UsageEventArchiveResult{Status: dto.UsageEventArchiveStatusEmpty}, nil
++	}
+ 	result := dto.UsageEventArchiveResult{Status: dto.UsageEventArchiveStatusEmpty}
+ 	for {
+ 		if err := ctx.Err(); err != nil {
+diff --git a/internal/repository/usage_request_history.go b/internal/repository/usage_request_history.go
+new file mode 100644
+index 0000000..69915b1
+--- /dev/null
++++ b/internal/repository/usage_request_history.go
+@@ -0,0 +1,66 @@
++package repository
++
++import (
++	"cpa-usage-keeper/internal/repository/dto"
++	"fmt"
++	"gorm.io/gorm"
++)
++
++const historySummaryColumns = ", summary_requests, summary_success, summary_failure, average_speed_tps, average_cache_rate"
++
++// Only the event list/export combines detail with daily rows. Existing overview
++// rollups remain the source of pricing, identity and overview statistics.
++func requestHistoryQuery(db *gorm.DB) (*gorm.DB, string) {
++	if !db.Migrator().HasTable("request_daily_stats") {
++		return db.Table("usage_events"), usageEventProjectionColumns
++	}
++	raw := "SELECT " + usageEventProjectionColumns + ", 0 AS summary_requests, 0 AS summary_success, 0 AS summary_failure, NULL AS average_speed_tps, NULL AS average_cache_rate FROM usage_events"
++	if db.Migrator().HasTable("usage_events_archive") {
++		raw += " UNION ALL SELECT " + usageEventProjectionColumns + ", 0 AS summary_requests, 0 AS summary_success, 0 AS summary_failure, NULL AS average_speed_tps, NULL AS average_cache_rate FROM usage_events_archive"
++	}
++	daily := `SELECT -id AS id, api_group_key, '' AS provider, '' AS auth_type, '' AS request_id,
++        NULL AS client_ip, NULL AS x_forwarded_for, NULL AS user_agent, model, '' AS model_alias,
++        '' AS reasoning_effort, '' AS service_tier, '' AS response_service_tier, '' AS executor_type,
++        '' AS endpoint, bucket_start AS timestamp, '' AS source, '' AS auth_index, NULL AS failed,
++        CAST(COALESCE(1.0*latency_sum_ms/NULLIF(latency_samples,0),0) AS INTEGER) AS latency_ms,
++        CAST(1.0*ttft_sum_ms/NULLIF(ttft_samples,0) AS INTEGER) AS ttft_ms,
++        input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_creation_tokens, total_tokens,
++        request_count AS summary_requests, success_count AS summary_success, failure_count AS summary_failure,
++        1000.0*speed_output_tokens/NULLIF(speed_elapsed_ms,0) AS average_speed_tps,
++        100.0*cache_rate_sum/NULLIF(cache_rate_samples,0) AS average_cache_rate
++        FROM request_daily_stats`
++	return db.Table("(" + raw + " UNION ALL " + daily + ") AS usage_events"), usageEventProjectionColumns + historySummaryColumns
++}
++
++// One batched lookup per page; request_id alone is not evidence of new input.
++func markNewRequestInputs(db *gorm.DB, rows []dto.UsageEventRecord) error {
++	if len(rows) == 0 || !db.Migrator().HasColumn("request_records", "new_input_count") {
++		return nil
++	}
++	ids := make([]string, 0, len(rows))
++	for _, row := range rows {
++		if row.RequestID != "" {
++			ids = append(ids, row.RequestID)
++		}
++	}
++	if len(ids) == 0 {
++		return nil
++	}
++	available := make(map[string]bool)
++	for start := 0; start < len(ids); start += 500 {
++		var matches []string
++		err := db.Raw(`SELECT a.request_id FROM request_attempts a JOIN request_records r ON r.id=a.record_id
++            WHERE a.request_id IN ? AND r.input_state='inferred_input' AND r.new_input_count>0
++            AND a.request_id=(SELECT request_id FROM request_attempts first_attempt WHERE first_attempt.record_id=r.id ORDER BY started_at,request_id LIMIT 1)`, ids[start:min(start+500, len(ids))]).Scan(&matches).Error
++		if err != nil {
++			return fmt.Errorf("load new input availability: %w", err)
++		}
++		for _, id := range matches {
++			available[id] = true
++		}
++	}
++	for i := range rows {
++		rows[i].HasNewInput = available[rows[i].RequestID]
++	}
++	return nil
++}
+diff --git a/internal/repository/usage_request_history_test.go b/internal/repository/usage_request_history_test.go
+new file mode 100644
+index 0000000..c39f172
+--- /dev/null
++++ b/internal/repository/usage_request_history_test.go
+@@ -0,0 +1,103 @@
++package repository
++
++import (
++	"cpa-usage-keeper/internal/config"
++	"cpa-usage-keeper/internal/entities"
++	"cpa-usage-keeper/internal/repository/dto"
++	"math"
++	"path/filepath"
++	"testing"
++	"time"
++)
++
++func TestRequestHistoryDailyRowsAndOutputSpeedSurviveCompaction(t *testing.T) {
++	previous := time.Local
++	time.Local, _ = time.LoadLocation("Asia/Shanghai")
++	t.Cleanup(func() { time.Local = previous })
++	db, err := OpenDatabase(config.Config{SQLitePath: filepath.Join(t.TempDir(), "history.db")})
++	if err != nil {
++		t.Fatal(err)
++	}
++	closeTestDatabase(t, db)
++	statement := `CREATE TABLE request_daily_stats AS SELECT 1 AS id,'2026-08-23' AS day,'2026-08-23T00:00:00+08:00' AS bucket_start,
++      'key-a' AS api_group_key,'model-a' AS model,3 AS request_count,2 AS success_count,1 AS failure_count,
++      1100 AS input_tokens,1100 AS output_tokens,0 AS reasoning_tokens,910 AS cache_read_tokens,0 AS cache_creation_tokens,2200 AS total_tokens,
++      11210 AS latency_sum_ms,3 AS latency_samples,200 AS ttft_sum_ms,2 AS ttft_samples,
++      1000 AS speed_output_tokens,11000 AS speed_elapsed_ms,2 AS speed_samples,1.0 AS cache_rate_sum,2 AS cache_rate_samples`
++	if err = db.Exec(statement).Error; err != nil {
++		t.Fatal(err)
++	}
++	day := time.Date(2026, 8, 23, 0, 0, 0, 0, time.Local)
++	end := day.AddDate(0, 0, 2)
++	if err = db.Create(&entities.CPAAPIKey{APIKey: "key-a"}).Error; err != nil {
++		t.Fatal(err)
++	}
++	ttft := int64(100)
++	// A late event on the same day must combine with the daily speed numerator/denominator.
++	if _, _, err = InsertUsageEvents(db, []entities.UsageEvent{{APIGroupKey: "key-a", Model: "model-a", Timestamp: day.Add(time.Hour), OutputTokens: 100, TTFTMS: &ttft, LatencyMS: 1100}}); err != nil {
++		t.Fatal(err)
++	}
++	filter := dto.UsageQueryFilter{Range: "custom", CustomUnit: "day", StartTime: &day, EndTime: &end, APIGroupKey: "key-a", PageSize: 10}
++	page, err := ListUsageEventsWithFilter(db, filter, emptyPricingResolverForTest())
++	if err != nil {
++		t.Fatal(err)
++	}
++	if page.TotalCount != 2 || len(page.Events) != 2 {
++		t.Fatalf("detail/daily union: %+v", page)
++	}
++	summary := page.Events[1]
++	if summary.ID >= 0 || summary.SummaryRequests != 3 || summary.SummarySuccess != 2 || summary.SummaryFailure != 1 || !summary.Timestamp.Equal(day) || summary.HasNewInput || summary.CostAvailable {
++		t.Fatalf("incorrect daily row: %+v", summary)
++	}
++	if summary.AverageSpeedTPS == nil || math.Abs(*summary.AverageSpeedTPS-1000.0/11) > 0.00001 || summary.AverageCacheRate == nil || *summary.AverageCacheRate != 50 {
++		t.Fatalf("invalid daily averages: %+v", summary)
++	}
++	exported, err := ExportUsageEventsWithFilter(db, filter, emptyPricingResolverForTest())
++	if err != nil || len(exported) != 2 || exported[1].SummaryRequests != 3 {
++		t.Fatalf("daily export mismatch: %+v %v", exported, err)
++	}
++	speed, err := BuildAnalysisOutputSpeedWithFilter(db, filter)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(speed.Models) != 1 || speed.Models[0].SampleCount != 3 || speed.Models[0].ExcludedCount != 1 || math.Abs(*speed.Models[0].AverageTPS-1100.0/12) > 0.00001 || math.Abs(*speed.Models[0].Points[0]-1100.0/12) > 0.00001 {
++		t.Fatalf("daily/live speed mismatch: %+v", speed)
++	}
++	filter.Result = "success"
++	filtered, err := ListUsageEventsWithFilter(db, filter, emptyPricingResolverForTest())
++	if err != nil || filtered.TotalCount != 1 {
++		t.Fatalf("mixed daily summary must not pretend to be an individual success: %+v %v", filtered, err)
++	}
++}
++
++func TestRequestHistoryOnlyNewInputFirstAttemptIsClickable(t *testing.T) {
++	db, err := OpenDatabase(config.Config{SQLitePath: filepath.Join(t.TempDir(), "input.db")})
++	if err != nil {
++		t.Fatal(err)
++	}
++	closeTestDatabase(t, db)
++	for _, sql := range []string{
++		`CREATE TABLE request_records(id TEXT PRIMARY KEY,input_state TEXT,new_input_count INTEGER)`,
++		`CREATE TABLE request_attempts(request_id TEXT PRIMARY KEY,record_id TEXT,started_at TEXT)`,
++		`INSERT INTO request_records VALUES('new','inferred_input',1),('auto','no_new_input',0),('uncertain','unconfirmed',0)`,
++		`INSERT INTO request_attempts VALUES('first','new','1'),('retry','new','2'),('tool','auto','3'),('candidate','uncertain','4')`,
++	} {
++		if err = db.Exec(sql).Error; err != nil {
++			t.Fatal(err)
++		}
++	}
++	for _, id := range []string{"first", "retry", "tool", "candidate", "missing"} {
++		if _, _, err = InsertUsageEvents(db, []entities.UsageEvent{{RequestID: id, Timestamp: time.Now()}}); err != nil {
++			t.Fatal(err)
++		}
++	}
++	page, err := ListUsageEventsWithFilter(db, dto.UsageQueryFilter{PageSize: 10}, emptyPricingResolverForTest())
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, row := range page.Events {
++		if row.HasNewInput != (row.RequestID == "first") {
++			t.Fatalf("wrong clickability: %+v", row)
++		}
++	}
++}
+diff --git a/internal/service/dto/usage.go b/internal/service/dto/usage.go
+index 63c1df1..2fe8465 100644
+--- a/internal/service/dto/usage.go
++++ b/internal/service/dto/usage.go
+@@ -52,6 +52,13 @@ type UsageEventFilterOptions struct {
+ 
+ // UsageEventRecord 是单条 usage event 的服务层结果。
+ type UsageEventRecord struct {
++	HasNewInput      bool
++	SummaryRequests  int64
++	SummarySuccess   int64
++	SummaryFailure   int64
++	AverageSpeedTPS  *float64
++	AverageCacheRate *float64
++
+ 	ID                  int64
+ 	Timestamp           time.Time
+ 	APIGroupKey         string
 diff --git a/internal/service/request_archive.go b/internal/service/request_archive.go
 new file mode 100644
 index 0000000..30f28ab
@@ -938,6 +1474,26 @@ index 0000000..5d5413d
 +		t.Fatal("invalid API key ID must not fall back to all users")
 +	}
 +}
+diff --git a/internal/service/usage.go b/internal/service/usage.go
+index 4cfef0a..f682bdd 100644
+--- a/internal/service/usage.go
++++ b/internal/service/usage.go
+@@ -692,6 +692,7 @@ func (s *usageService) ListUsageEvents(ctx context.Context, filter servicedto.Us
+ 	result := make([]servicedto.UsageEventRecord, 0, len(page.Events))
+ 	for _, row := range page.Events {
+ 		result = append(result, servicedto.UsageEventRecord{
++			HasNewInput: row.HasNewInput, SummaryRequests: row.SummaryRequests, SummarySuccess: row.SummarySuccess, SummaryFailure: row.SummaryFailure, AverageSpeedTPS: row.AverageSpeedTPS, AverageCacheRate: row.AverageCacheRate,
+ 			ID:                  row.ID,
+ 			Timestamp:           row.Timestamp,
+ 			APIGroupKey:         row.APIGroupKey,
+@@ -746,6 +747,7 @@ func (s *usageService) StreamUsageEvents(ctx context.Context, filter servicedto.
+ 		Result:       filter.Result,
+ 	}, func(row repodto.UsageEventRecord) error {
+ 		return emit(servicedto.UsageEventRecord{
++			HasNewInput: row.HasNewInput, SummaryRequests: row.SummaryRequests, SummarySuccess: row.SummarySuccess, SummaryFailure: row.SummaryFailure, AverageSpeedTPS: row.AverageSpeedTPS, AverageCacheRate: row.AverageCacheRate,
+ 			ID:                  row.ID,
+ 			Timestamp:           row.Timestamp,
+ 			APIGroupKey:         row.APIGroupKey,
 diff --git a/internal/service/usage_output_speed.go b/internal/service/usage_output_speed.go
 new file mode 100644
 index 0000000..7d5a322
@@ -1045,8 +1601,51 @@ index 391f250..a1a9d55 100644
                  </div>
                );
              })}
+diff --git a/web/src/components/usage/RequestEventsDetailsCard.test.tsx b/web/src/components/usage/RequestEventsDetailsCard.test.tsx
+index a3a3a29..ca3d0ea 100644
+--- a/web/src/components/usage/RequestEventsDetailsCard.test.tsx
++++ b/web/src/components/usage/RequestEventsDetailsCard.test.tsx
+@@ -269,9 +269,19 @@ describe('RequestEventsDetailsCard pagination', () => {
+     expect(html).not.toContain('aria-label="Credential"');
+   });
+ 
++  it('does not offer empty logs for automatic steps even when a request id exists', () => {
++    const html = renderCard({
++      events: [{ ...events[0], request_id: 'automatic-step', has_new_input: false }],
++      requestLogAccessEnabled: true,
++      onRequestLogOpen: () => undefined,
++    });
++    expect(html).not.toContain('View request log');
++    expect(html).not.toContain('requestEventsResultLogIcon');
++  });
++
+   it('renders the Result badge as a request log trigger when request id is available', () => {
+     const html = renderCard({
+-      events: [{ ...events[0], request_id: 'req-log-101' }],
++      events: [{ ...events[0], request_id: 'req-log-101', has_new_input: true }],
+       requestLogAccessEnabled: true,
+       onRequestLogOpen: () => undefined,
+     });
+@@ -285,7 +295,7 @@ describe('RequestEventsDetailsCard pagination', () => {
+ 
+   it('renders the Result badge as a request log trigger when the event id is missing', () => {
+     const html = renderCard({
+-      events: [{ ...events[0], id: undefined, request_id: 'req-log-missing-id' }],
++      events: [{ ...events[0], id: undefined, request_id: 'req-log-missing-id', has_new_input: true }],
+       requestLogAccessEnabled: true,
+       onRequestLogOpen: () => undefined,
+     });
+@@ -296,7 +306,7 @@ describe('RequestEventsDetailsCard pagination', () => {
+ 
+   it('keeps the Result badge label stable while a request log loads', () => {
+     const html = renderCard({
+-      events: [{ ...events[0], request_id: 'req-log-101' }],
++      events: [{ ...events[0], request_id: 'req-log-101', has_new_input: true }],
+       requestLogAccessEnabled: true,
+       onRequestLogOpen: () => undefined,
+       requestLogLoadingEventId: '101',
 diff --git a/web/src/components/usage/RequestEventsDetailsCard.tsx b/web/src/components/usage/RequestEventsDetailsCard.tsx
-index b005c41..236e0ea 100644
+index b005c41..db33c7f 100644
 --- a/web/src/components/usage/RequestEventsDetailsCard.tsx
 +++ b/web/src/components/usage/RequestEventsDetailsCard.tsx
 @@ -138,6 +138,10 @@ const REQUEST_LOG_SECTION_TITLE_KEYS: Record<string, string> = {
@@ -1077,7 +1676,33 @@ index b005c41..236e0ea 100644
  const isPreferredRequestLogChunkBreak = (character: string) =>
    character === ','
    || character === '}'
-@@ -1333,7 +1347,9 @@ export function RequestEventsDetailsCard({
+@@ -737,7 +751,7 @@ export function RequestEventsDetailsCard({
+         cacheReadTokens,
+         cacheCreationTokens,
+         totalTokens,
+-        cacheReadRate: formatCacheReadRate(cacheReadTokens, inputTokens),
++        cacheReadRate: event.summary_requests ? (Number.isFinite(event.average_cache_rate) ? `${event.average_cache_rate!.toFixed(1)}%` : '-') : formatCacheReadRate(cacheReadTokens, inputTokens),
+         cost,
+         costAvailable,
+       };
+@@ -956,10 +970,15 @@ export function RequestEventsDetailsCard({
+         label: t('usage_stats.request_events_result'),
+         header: <th className={styles.requestEventsNoWrapCell}>{t('usage_stats.request_events_result')}</th>,
+         renderCell: (row) => {
++          if (row.event.summary_requests) {
++            return <td className={styles.requestEventsNoWrapCell} title={t('usage_stats.request_daily_summary_hint', { success: row.event.summary_success ?? 0, failure: row.event.summary_failure ?? 0 })}>
++              {t('usage_stats.request_daily_summary', { count: row.event.summary_requests })}
++            </td>;
++          }
+           const resultLabel = row.failed ? t('usage_stats.failure') : t('usage_stats.success');
+           const loading = requestLogLoadingEventId === row.id;
+           const resultClassName = row.failed ? styles.requestEventsResultFailed : styles.requestEventsResultSuccess;
+-          const canOpenLog = Boolean(requestLogAccessEnabled && row.requestId && onRequestLogOpen);
++          const canOpenLog = Boolean(requestLogAccessEnabled && row.event.has_new_input === true && row.requestId && onRequestLogOpen);
+           return (
+             <td className={styles.requestEventsNoWrapCell}>
+               {canOpenLog ? (
+@@ -1333,7 +1352,9 @@ export function RequestEventsDetailsCard({
                      <RequestLogSectionDisclosure
                        key={`${requestLogResponse.event_id}-${section.title}-${index}`}
                        title={formatRequestLogSectionTitle(section.title, t)}
@@ -1400,6 +2025,89 @@ index 0000000..24cdb70
 +      })}{accounts.length === 0 && <tr><td colSpan={5} className="gw-empty">{aliases.error ? '请重试加载认证文件' : '暂无已同步的认证文件'}</td></tr>}</tbody></table></div>
 +      <div className="gw-inline"><button disabled={busy}>保存账号调度</button><button type="button" disabled={busy} onClick={aliases.reload}>刷新认证文件</button><span className="gw-help">别名单独保存；参与调度和并发修改后请保存账号调度。</span></div>
 +    </form>}
++  </section>;
++}
+diff --git a/web/src/features/gateway/HistoryRetentionSettings.test.tsx b/web/src/features/gateway/HistoryRetentionSettings.test.tsx
+new file mode 100644
+index 0000000..9eb9600
+--- /dev/null
++++ b/web/src/features/gateway/HistoryRetentionSettings.test.tsx
+@@ -0,0 +1,31 @@
++// @vitest-environment happy-dom
++import { act } from 'react';
++import { createRoot, type Root } from 'react-dom/client';
++import { beforeEach, afterEach, it, expect, vi } from 'vitest';
++import { HistoryRetentionSettings } from './HistoryRetentionSettings';
++import { gatewayAPI } from './api';
++vi.mock('./api', () => ({ gatewayAPI: vi.fn() }));
++globalThis.IS_REACT_ACT_ENVIRONMENT = true;
++let container: HTMLDivElement; let root: Root;
++beforeEach(() => {
++  vi.clearAllMocks();container=document.createElement('div');document.body.appendChild(container);root=createRoot(container);
++  vi.mocked(gatewayAPI).mockImplementation(async (_path,method,body) => ({ days:method==='PUT'?(body as {days:number}).days:60,daily_rows:0,last_cleanup:null,cutoff:'' }));
++});
++afterEach(async () => {await act(async () => root.unmount());container.remove();});
++it('loads the saved duration and persists changes without modifying quota settings', async () => {
++  await act(async () => root.render(<HistoryRetentionSettings />));
++  const input=container.querySelector('input')!;
++  expect(input.value).toBe('60');
++  await act(async () => {Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')!.set!.call(input,'120');input.dispatchEvent(new Event('input',{bubbles:true}));});
++  await act(async () => container.querySelector('button')!.click());
++  expect(gatewayAPI).toHaveBeenLastCalledWith('history-retention','PUT',{days:120});
++  expect(container.textContent).toContain('已保存 120 天');
++  expect(container.textContent).toContain('不会恢复已汇总的明细');
++});
++it('shows server failure without falsely reporting a successful change', async () => {
++  await act(async () => root.render(<HistoryRetentionSettings />));
++  vi.mocked(gatewayAPI).mockRejectedValueOnce(new Error('保存失败'));
++  await act(async () => container.querySelector('button')!.click());
++  expect(container.querySelector('[role=status]')?.textContent).toContain('保存失败');
++  expect(container.textContent).not.toContain('后台将按新期限');
++});
+diff --git a/web/src/features/gateway/HistoryRetentionSettings.tsx b/web/src/features/gateway/HistoryRetentionSettings.tsx
+new file mode 100644
+index 0000000..3286023
+--- /dev/null
++++ b/web/src/features/gateway/HistoryRetentionSettings.tsx
+@@ -0,0 +1,40 @@
++import { useEffect, useState } from 'react';
++import { gatewayAPI } from './api';
++import './gateway.css';
++
++type Retention = { days: number; cutoff: string; daily_rows: number; last_cleanup: { finished_at: string; waiting_for_sync: boolean } | null };
++export function HistoryRetentionSettings() {
++  const [value, setValue] = useState('60');
++  const [saved, setSaved] = useState<Retention | null>(null);
++  const [busy, setBusy] = useState(false);
++  const [message, setMessage] = useState('');
++  useEffect(() => {
++    const controller = new AbortController();
++    gatewayAPI<Retention>('history-retention', 'GET', undefined, controller.signal)
++      .then(data => { setSaved(data); setValue(String(data.days)); })
++      .catch(error => { if (!controller.signal.aborted) setMessage(String(error)); });
++    return () => controller.abort();
++  }, []);
++  const save = async () => {
++    const days = Number(value);
++    if (!Number.isInteger(days) || days < 1 || days > 3650) { setMessage('请输入 1 到 3650 之间的整数天数。'); return; }
++    setBusy(true); setMessage('');
++    try {
++      const data = await gatewayAPI<Retention>('history-retention', 'PUT', { days });
++      setSaved(data); setValue(String(data.days)); setMessage('已保存，后台将按新期限整理历史请求。');
++    } catch (error) { setMessage(String(error)); }
++    finally { setBusy(false); }
++  };
++  return <section className="gw-card" aria-label="历史请求保存时间">
++    <h3>历史请求保存时间</h3>
++    <p>保留期限内的请求明细和新增用户提示词。更早的请求按 API Key、模型和自然日汇总，保留请求数、平均延迟、平均输出速度、Token 总量与平均缓存率。</p>
++    <div className="gw-retention-form">
++      <label>保存天数 <input aria-label="历史请求保存天数" type="number" min="1" max="3650" step="1" value={value} onChange={event => setValue(event.target.value)} disabled={!saved || busy} /></label>
++      <span>天（默认 60 天）</span>
++      <button type="button" disabled={!saved || busy} onClick={() => void save()}>{busy ? '保存中…' : '保存设置'}</button>
++    </div>
++    <p className="gw-muted">日汇总长期保留。汇总后不再保留原请求明细和提示词，延长保存时间不会恢复已汇总的明细。额度账本保留用于计费核对。</p>
++    {saved && <p className="gw-muted">已保存 {saved.days} 天，现有 {saved.daily_rows} 条历史日汇总。{saved.last_cleanup?.waiting_for_sync ? '部分记录正在等待统计与计费同步完成。' : ''}</p>}
++    {message && <p role="status">{message}</p>}
 +  </section>;
 +}
 diff --git a/web/src/features/gateway/LocalRankingPanel.tsx b/web/src/features/gateway/LocalRankingPanel.tsx
@@ -1746,10 +2454,10 @@ index 0000000..010e3a5
 +}
 diff --git a/web/src/features/gateway/gateway.css b/web/src/features/gateway/gateway.css
 new file mode 100644
-index 0000000..ca5ed0e
+index 0000000..b9bdb94
 --- /dev/null
 +++ b/web/src/features/gateway/gateway.css
-@@ -0,0 +1,11 @@
+@@ -0,0 +1,14 @@
 +.gw-card{padding:22px;border:1px solid var(--border-color,#dfe3eb);border-radius:16px;background:var(--bg-primary,#fff);color:var(--text-primary,#202938);margin-bottom:20px;box-shadow:0 3px 14px #152a4810}.gw-heading{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}.gw-card h2{font-size:18px;margin:0 0 7px}.gw-card p{color:var(--text-secondary,#68758b);font-size:13px;line-height:1.65;margin:4px 0 16px}.gw-status{font-size:12px;color:#15976e;border:1px solid #91ddc1;border-radius:20px;padding:6px 12px}.gw-error{color:#bd4352;border-color:#e9a7af}.gw-pools{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin-top:20px}.gw-pool{border:1px solid #bacbe04d;border-radius:20px;padding:18px;background:linear-gradient(180deg,#8aa4d00a,#86a1ce12);min-width:0}.gw-pool-active{border-color:#55ba934d;background:linear-gradient(180deg,#48c59708,#48c59712)}.gw-pool-personal{border-color:#a591ce4d;background:linear-gradient(180deg,#a18bd008,#a18bd012)}.gw-pool-title{display:flex;align-items:center;justify-content:space-between}.gw-pool h3{font-size:15px;margin:0}.gw-pool strong{font-size:26px;font-variant-numeric:tabular-nums}.gw-pool strong small{font-size:12px;font-weight:400;color:var(--text-secondary,#68758b)}.gw-balls{min-height:210px;max-height:360px;overflow:auto;display:flex;flex-wrap:wrap;gap:12px;align-items:flex-start;align-content:flex-start;padding:14px 2px}.gw-ball{width:64px;height:64px;flex:0 0 64px;display:flex;align-items:center;justify-content:center;border-radius:50%;color:#fff;background:radial-gradient(circle at 30% 24%,hsl(var(--user-hue) 77% 72%),hsl(var(--user-hue) 62% 43%) 70%);box-shadow:inset 0 -3px 6px #0002,0 5px 9px #22334c16;border:1px solid #ffffff60;animation:gw-arrive .35s ease-out}.gw-ball span{font-size:12px;line-height:1.2;max-width:55px;overflow-wrap:anywhere;text-align:center;text-shadow:0 1px 2px #0005}.gw-pool-active .gw-ball{animation:gw-arrive .35s ease-out,gw-breathe 3s ease-in-out infinite}.gw-pool-empty{align-self:center;display:block;width:100%;text-align:center;color:var(--text-secondary,#68758b);font-size:12px;margin-top:70px}.gw-legend{display:flex;gap:16px;flex-wrap:wrap;margin-top:18px;font-size:12px}.gw-legend span{display:flex;align-items:center;gap:6px}.gw-legend i{width:8px;height:8px;border-radius:50%}.gw-inline{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;margin:16px 0}.gw-card label,.gw-policy label{display:flex;flex-direction:column;gap:6px;font-size:12px;color:var(--text-secondary,#68758b)}.gw-card input:not([type=checkbox]),.gw-card select,.gw-policy input:not([type=checkbox]),.gw-policy select{border:1px solid var(--border-color,#d3dae5);border-radius:8px;background:var(--bg-primary,#fff);color:var(--text-primary,#202938);padding:8px 10px;min-width:0;width:100%}.gw-card input[type=number],.gw-policy input[type=number]{max-width:135px}.gw-check{flex-direction:row!important;align-items:center;gap:6px!important}.gw-card button,.gw-policy button{padding:8px 14px;border-radius:8px;border:1px solid var(--border-color,#d3dae5);background:var(--bg-secondary,#f4f6fa);color:var(--text-primary,#27364f);cursor:pointer}.gw-card button:disabled,.gw-policy button:disabled{opacity:.5;cursor:wait}.gw-table-wrap{overflow:auto;margin:16px 0}.gw-table{width:100%;border-collapse:collapse;text-align:left;font-size:13px}.gw-table th,.gw-table td{padding:12px;border-bottom:1px solid var(--border-color,#dfe3eb)}.gw-table th{font-size:12px;color:var(--text-secondary,#68758b);font-weight:500}.gw-table small{display:block;font-size:11px;color:var(--text-secondary,#68758b);overflow-wrap:anywhere;max-width:320px}.gw-help{max-width:950px}.gw-message{padding:10px;background:#7799ee12;border-radius:8px}.gw-policy{grid-column:1/-1;flex-basis:100%;width:100%;border-top:1px solid var(--border-color,#e2e7ef);padding-top:12px;margin-top:10px}.gw-usage{display:flex;flex-wrap:wrap;gap:18px;font-size:12px}.gw-policy-fields{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;margin-top:12px}.gw-policy-fields>label{min-width:100px}.gw-policy .gw-error{font-size:12px}.gw-card .gw-check input{width:auto}.gw-policy progress{width:120px;accent-color:#5497dc;height:6px}.gw-policy select{max-width:240px}@keyframes gw-arrive{from{transform:scale(.7);opacity:0}to{transform:scale(1);opacity:1}}@keyframes gw-breathe{50%{translate:0 -3px}}@media(prefers-reduced-motion:reduce){.gw-ball,.gw-pool-active .gw-ball{animation:none}}@media(max-width:800px){.gw-pools{grid-template-columns:1fr}.gw-balls{min-height:130px}.gw-pool-empty{margin-top:30px}.gw-card{padding:16px}}
 +
 +.gw-users>.gw-inline{gap:12px}.gw-users>.gw-inline>input,.gw-users>.gw-inline>button{border:1px solid var(--border-color);border-radius:10px;background:var(--bg-primary);color:var(--text-primary);padding:9px 14px;font-size:12px}.gw-users>.gw-inline>label{font-size:12px}.gw-users>.gw-inline>button{cursor:pointer}.gw-users>.gw-inline>button:disabled{opacity:.5}
@@ -1761,6 +2469,9 @@ index 0000000..ca5ed0e
 +
 +/* Keep compact editing widths even when the account column absorbs spare room. */
 +.gw-users-table .gw-alias-input{width:calc(3em + 14px)!important}.gw-users-table .gw-quota-input{width:calc(4ch + 14px)!important}.gw-users-table input[type=number]{appearance:textfield;-moz-appearance:textfield}.gw-users-table input[type=number]::-webkit-inner-spin-button,.gw-users-table input[type=number]::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
++
++.gw-retention-form { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
++.gw-retention-form input { width:6em; margin-left:8px; }
 diff --git a/web/src/features/gateway/useAccountAliases.test.ts b/web/src/features/gateway/useAccountAliases.test.ts
 new file mode 100644
 index 0000000..e49b66b
@@ -1820,7 +2531,7 @@ index 0000000..d4bdab5
 +  return { accounts, byAccount, names, error, reload };
 +}
 diff --git a/web/src/i18n/index.ts b/web/src/i18n/index.ts
-index d0de019..f7844d3 100644
+index d0de019..cdcff60 100644
 --- a/web/src/i18n/index.ts
 +++ b/web/src/i18n/index.ts
 @@ -43,7 +43,7 @@ const resources = {
@@ -1832,11 +2543,13 @@ index d0de019..f7844d3 100644
          login_subtitle: 'Every flow leaves a trace.',
          console_kicker: 'Access control',
          console_title: 'Choose your console',
-@@ -275,6 +275,18 @@ const resources = {
+@@ -275,6 +275,20 @@ const resources = {
          request_events_log_copy_failed_section: 'Unable to copy {{section}}',
          request_events_log_section: 'Section',
          request_events_log_section_request_info: 'Request Info',
 +        request_events_log_section_user_prompts: 'User Prompts',
++        request_daily_summary: 'Daily total · {{count}} requests',
++        request_daily_summary_hint: 'Daily summary: {{success}} succeeded, {{failure}} failed. Latency/speed/cache rate are averages; tokens are totals. Filter summaries by API Key, model and calendar date.',
 +        request_input_retry: 'This is an upstream retry of the same request, not a new user input.',
 +        request_events_log_section_input_status: 'Input detection',
 +        request_events_log_section_new_input: 'New input (inferred)',
@@ -1851,7 +2564,7 @@ index d0de019..f7844d3 100644
          request_events_log_section_headers: 'Headers',
          request_events_log_section_api_request: 'API Request',
          request_events_log_section_api_response: 'API Response',
-@@ -790,7 +802,7 @@ const resources = {
+@@ -790,7 +804,7 @@ const resources = {
          no_requests: '暂无请求'
        },
        auth: {
@@ -1860,11 +2573,13 @@ index d0de019..f7844d3 100644
          login_subtitle: '万千流转，皆有迹可循。',
          console_kicker: '访问控制',
          console_title: '选择访问方式',
-@@ -1022,6 +1034,18 @@ const resources = {
+@@ -1022,6 +1036,20 @@ const resources = {
          request_events_log_copy_failed_section: '无法复制{{section}}',
          request_events_log_section: '日志段落',
          request_events_log_section_request_info: '请求信息',
 +        request_events_log_section_user_prompts: '用户提示词',
++        request_daily_summary: '日汇总 · {{count}} 次',
++        request_daily_summary_hint: '成功 {{success}} 次，失败 {{failure}} 次。延迟、速度与缓存率为平均值，Token 为总量。日汇总支持按 API Key、模型和自然日筛选。',
 +        request_input_retry: '这是同一请求的上游重试，不是新的用户输入。',
 +        request_events_log_section_input_status: '输入判断',
 +        request_events_log_section_new_input: '本次新增输入（推断）',
@@ -1879,7 +2594,7 @@ index d0de019..f7844d3 100644
          request_events_log_section_headers: '请求头',
          request_events_log_section_api_request: 'API 请求',
          request_events_log_section_api_response: 'API 响应',
-@@ -1537,7 +1561,7 @@ const resources = {
+@@ -1537,7 +1565,7 @@ const resources = {
          no_requests: '尚無請求'
        },
        auth: {
@@ -1888,11 +2603,13 @@ index d0de019..f7844d3 100644
          login_subtitle: '萬千流轉，皆有跡可循。',
          console_kicker: '存取控制',
          console_title: '選擇存取方式',
-@@ -1769,6 +1793,18 @@ const resources = {
+@@ -1769,6 +1797,20 @@ const resources = {
          request_events_log_copy_failed_section: '無法複製{{section}}',
          request_events_log_section: '日誌段落',
          request_events_log_section_request_info: '請求資訊',
 +        request_events_log_section_user_prompts: '使用者提示詞',
++        request_daily_summary: '日彙總 · {{count}} 次',
++        request_daily_summary_hint: '成功 {{success}} 次，失敗 {{failure}} 次。延遲、速度與快取率為平均值，Token 為總量。日彙總支援依 API Key、模型與自然日篩選。',
 +        request_input_retry: '這是同一請求的上游重試，不是新的使用者輸入。',
 +        request_events_log_section_input_status: '輸入判斷',
 +        request_events_log_section_new_input: '本次新增輸入（推斷）',
@@ -1939,10 +2656,23 @@ index 07064a7..274f16f 100644
    const response = await apiFetch(apiPath('/usage/api-keys/options'), { signal, cache: 'no-store' })
    if (!response.ok) {
 diff --git a/web/src/lib/types.ts b/web/src/lib/types.ts
-index 4296e1d..1ba063a 100644
+index 4296e1d..52e7391 100644
 --- a/web/src/lib/types.ts
 +++ b/web/src/lib/types.ts
-@@ -794,3 +794,21 @@ export interface UsageFilterWindow {
+@@ -239,6 +239,12 @@ export interface UsageEventTokens {
+ }
+ 
+ export interface UsageEvent {
++  has_new_input?: boolean
++  summary_requests?: number
++  summary_success?: number
++  summary_failure?: number
++  average_cache_rate?: number
++
+   id?: string
+   request_id?: string
+   timestamp: string
+@@ -794,3 +800,21 @@ export interface UsageFilterWindow {
    endMs?: number
    windowMinutes?: number
  }
@@ -1965,7 +2695,7 @@ index 4296e1d..1ba063a 100644
 +  models: ModelOutputSpeed[]
 +}
 diff --git a/web/src/pages/UsagePage.tsx b/web/src/pages/UsagePage.tsx
-index 58c4cf5..894a7d2 100644
+index 58c4cf5..ddd808c 100644
 --- a/web/src/pages/UsagePage.tsx
 +++ b/web/src/pages/UsagePage.tsx
 @@ -1,7 +1,7 @@
@@ -1987,7 +2717,7 @@ index 58c4cf5..894a7d2 100644
    PriceSettingsCard,
    AuthFileCredentialsSection,
    AiProviderCredentialsSection,
-@@ -44,13 +42,11 @@ import { getDailyAverageCardUsage, isDailyAverageRange } from '@/utils/usage/ove
+@@ -44,13 +42,12 @@ import { getDailyAverageCardUsage, isDailyAverageRange } from '@/utils/usage/ove
  import type { Theme } from '@/types';
  import { BrandLink } from '@/components/BrandLink';
  import { isCPAMCEmbed } from '@/embed/cpamcEmbed';
@@ -2000,13 +2730,14 @@ index 58c4cf5..894a7d2 100644
 -import type { LocalRankingProfileRequest, RankingScope } from '@/features/ranking/types';
 +import { QueuePools } from '@/features/gateway/QueuePools';
 +import { AccountRouting } from '@/features/gateway/AccountRouting';
++import { HistoryRetentionSettings } from '@/features/gateway/HistoryRetentionSettings';
 +import { UserQuotaSettings } from '@/features/gateway/UserQuotaSettings';
 +import { ModelOutputSpeedCard } from '@/components/usage/analysis/ModelOutputSpeedCard';
 +import { LocalRankingPanel } from '@/features/gateway/LocalRankingPanel';
  import styles from './UsagePage.module.scss';
  
  const TIME_RANGE_STORAGE_KEY = 'cli-proxy-usage-time-range-v1';
-@@ -65,8 +61,6 @@ const THEME_OPTIONS: ReadonlyArray<{ value: Theme; labelKey: string }> = [
+@@ -65,8 +62,6 @@ const THEME_OPTIONS: ReadonlyArray<{ value: Theme; labelKey: string }> = [
    { value: 'auto', labelKey: 'usage_stats.theme_auto' }
  ];
  const USAGE_TAB_OPTIONS = ['overview', 'analysis', 'ranking', 'events', 'auth-files', 'ai-provider', 'settings'] as const;
@@ -2015,7 +2746,16 @@ index 58c4cf5..894a7d2 100644
  type UsageTab = (typeof USAGE_TAB_OPTIONS)[number];
  type Translate = (key: string) => string;
  const USAGE_TAB_LABEL_KEYS: Record<UsageTab, string> = {
-@@ -785,9 +779,9 @@ export const normalizeUsageTabValue = (value: unknown): UsageTab | null => {
+@@ -82,7 +77,7 @@ const DEFAULT_USAGE_TAB: UsageTab = 'overview';
+ const USAGE_TAB_STORAGE_KEY = 'cli-proxy-usage-tab-v1';
+ const REQUEST_EVENTS_PAGE_SIZES = [20, 50, 100, 500, 1000] as const;
+ const REQUEST_EVENTS_DEFAULT_PAGE_SIZE = 50;
+-const REQUEST_EVENTS_CUSTOM_DAY_RANGE_MAX_DAYS = 90;
++const REQUEST_EVENTS_CUSTOM_DAY_RANGE_MAX_DAYS = 365;
+ // v7 是完整列顺序格式；v8 加入客户端请求元数据列，并保留历史自定义顺序。
+ const REQUEST_EVENTS_PREFERENCES_VERSION = 8;
+ const ALL_REQUEST_EVENTS_FILTER = '__all__';
+@@ -785,9 +780,9 @@ export const normalizeUsageTabValue = (value: unknown): UsageTab | null => {
  
  export const getUsageTabOptions = (
    translate: Translate,
@@ -2027,7 +2767,7 @@ index 58c4cf5..894a7d2 100644
      value,
      label: translate(USAGE_TAB_LABEL_KEYS[value]),
    }));
-@@ -851,13 +845,9 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -851,13 +846,9 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
    const isDark = resolvedTheme === 'dark';
    const [activeTab, setActiveTab] = useState<UsageTab>(() => {
      const loadedTab = loadUsageTab();
@@ -2043,7 +2783,7 @@ index 58c4cf5..894a7d2 100644
    const [loadedTimeRange] = useState(loadTimeRange);
    const pendingLegacyCustomRangeRef = useRef(loadedTimeRange.pendingLegacyCustomRange);
    const [timeRangeState, setTimeRangeState] = useState<StoredUsageRangeState>(loadedTimeRange.state);
-@@ -866,7 +856,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -866,7 +857,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
    const [selectedApiKeyId, setSelectedApiKeyId] = useState('');
    const [apiKeyOptions, setApiKeyOptions] = useState<CpaApiKeyOption[]>([]);
    const [status, setStatus] = useState<StatusResponse | null>(null);
@@ -2052,7 +2792,7 @@ index 58c4cf5..894a7d2 100644
    const apiKeyOptionsRequestControllerRef = useRef<AbortController | null>(null);
    const credentialSectionVisibility = getCredentialSectionVisibility(activeTab);
    const activeCustomRange = useMemo(() => getUsageCustomRangeForTab(activeTab, customRange, {
-@@ -976,15 +966,8 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -976,15 +967,8 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
    const [apiKeySettingsError, setApiKeySettingsError] = useState('');
    const [apiKeySettingsSavingId, setApiKeySettingsSavingId] = useState<string | null>(null);
    const apiKeySettingsRequestControllerRef = useRef<AbortController | null>(null);
@@ -2068,7 +2808,7 @@ index 58c4cf5..894a7d2 100644
    const [loggingOut, setLoggingOut] = useState(false);
    const [logoutConfirmOpen, setLogoutConfirmOpen] = useState(false);
    const topNoticeTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
-@@ -1026,45 +1009,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -1026,45 +1010,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
        topNoticeTimerRef.current = null;
      }, getUpdateCheckToastDuration(kind));
    }, []);
@@ -2114,7 +2854,7 @@ index 58c4cf5..894a7d2 100644
    const credentialsData = useCredentialsTabData({
      enabledAuthFiles: credentialSectionVisibility.showAuthFiles && pageVisible,
      enabledAiProviders: credentialSectionVisibility.showAiProvider && pageVisible,
-@@ -1073,6 +1017,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -1073,6 +1018,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
    });
    const refreshCredentials = credentialsData.refresh;
    const [analysisLoading, setAnalysisLoading] = useState(false);
@@ -2122,7 +2862,7 @@ index 58c4cf5..894a7d2 100644
    const [analysisError, setAnalysisError] = useState('');
    const [analysisData, setAnalysisData] = useState<AnalysisResponse | null>(null);
    const [analysisLatencyLoading, setAnalysisLatencyLoading] = useState(false);
-@@ -1112,7 +1057,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -1112,7 +1058,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
      if (topNotice.kind === 'success') return styles.updateCheckToastSuccess;
      return styles.updateCheckToastInfo;
    })() : '';
@@ -2130,7 +2870,7 @@ index 58c4cf5..894a7d2 100644
  
    const loadApiKeyOptions = useCallback(async () => {
      apiKeyOptionsRequestControllerRef.current?.abort();
-@@ -1174,39 +1118,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -1174,39 +1119,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
      }
    }, [onAuthRequired]);
  
@@ -2170,7 +2910,7 @@ index 58c4cf5..894a7d2 100644
    const handleSaveApiKeyAlias = useCallback(async (id: string, keyAlias: string) => {
      setApiKeySettingsSavingId(id);
      setApiKeySettingsError('');
-@@ -1214,45 +1125,19 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -1214,45 +1126,19 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
        const updated = await updateCpaApiKeyAlias(id, keyAlias);
        setApiKeySettings((current) => current.map((item) => (item.id === updated.id ? { ...item, ...updated } : item)));
        setApiKeyOptions((current) => current.map((item) => (item.id === updated.id ? updated : item)));
@@ -2218,7 +2958,7 @@ index 58c4cf5..894a7d2 100644
  
    const loadAnalysis = useCallback(async () => {
      if (!usageRangeQuery.valid) return;
-@@ -1261,6 +1146,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -1261,6 +1147,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
      analysisRequestControllerRef.current = controller;
  
      setAnalysisLoading(true);
@@ -2226,7 +2966,7 @@ index 58c4cf5..894a7d2 100644
      setAnalysisError('');
      setAnalysisData(null);
      setAnalysisLatencyLoading(true);
-@@ -1435,11 +1321,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -1435,11 +1322,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
      }
    }, [apiKeyOptions, selectedApiKeyId]);
  
@@ -2239,7 +2979,7 @@ index 58c4cf5..894a7d2 100644
  
    useEffect(() => () => {
      if (topNoticeTimerRef.current !== null) {
-@@ -1656,10 +1538,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -1656,10 +1539,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
        await Promise.all([loadEventFilterOptions(), loadEvents()]);
        return;
      }
@@ -2251,7 +2991,7 @@ index 58c4cf5..894a7d2 100644
      if (credentialSectionVisibility.enabled) {
        await refreshCredentials();
        return;
-@@ -1669,11 +1548,11 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -1669,11 +1549,11 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
        return;
      }
      if (activeTab === 'settings') {
@@ -2265,7 +3005,7 @@ index 58c4cf5..894a7d2 100644
  
    const refreshAutoRefreshTab = useCallback(async () => {
      if (activeTab === 'events') {
-@@ -1732,34 +1611,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -1732,34 +1612,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
      }
    }, [onAuthRequired]);
  
@@ -2300,7 +3040,7 @@ index 58c4cf5..894a7d2 100644
    useEffect(() => scheduleOverviewAutoRefresh({
      enabled: autoRefreshEnabled,
      refreshOverview: refreshAutoRefreshTab,
-@@ -1826,20 +1677,14 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -1826,20 +1678,14 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
        apiKeySettingsRequestControllerRef.current?.abort();
        apiKeySettingsRequestControllerRef.current = null;
        setApiKeySettingsLoading(false);
@@ -2322,7 +3062,7 @@ index 58c4cf5..894a7d2 100644
  
    useEffect(() => {
      const next = sanitizeRequestEventFilters(
-@@ -1877,7 +1722,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -1877,7 +1723,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
      : '';
    // 只有需要时间范围的 tab 才渲染 Range 控件，避免 Credentials/Pricing 产生空白占位。
    const showRangeControls = shouldShowRangeControls(activeTab);
@@ -2330,7 +3070,7 @@ index 58c4cf5..894a7d2 100644
    const {
      requestsSparkline,
      tokensSparkline,
-@@ -1896,6 +1740,67 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -1896,6 +1741,67 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
    });
    const dailyAverageCardUsage = getDailyAverageCardUsage(currentOverviewUsage, usage, reserveDailyAverageCard, loading);
  
@@ -2398,7 +3138,7 @@ index 58c4cf5..894a7d2 100644
    return (
      <div className={styles.pageShell} data-keeper-page="usage">
        <div className={styles.pageFrame}>
-@@ -1922,30 +1827,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -1922,30 +1828,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
                  );
                })}
              </div>
@@ -2429,7 +3169,7 @@ index 58c4cf5..894a7d2 100644
              <MainActionButton
                type="button"
                aria-label={t('common.logout')}
-@@ -1969,27 +1850,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -1969,27 +1851,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
                </div>
              )}
  
@@ -2457,7 +3197,7 @@ index 58c4cf5..894a7d2 100644
  
              {topNotice && (
                <div
-@@ -2035,82 +1895,13 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -2035,82 +1896,13 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
                  ))}
                </div>
  
@@ -2542,7 +3282,7 @@ index 58c4cf5..894a7d2 100644
  
              {activeTab === 'overview' && (
                <>
-@@ -2161,46 +1952,18 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -2161,46 +1953,18 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
                    latencyDiagnostics={analysisLatencyData}
                    latencyLoading={analysisLatencyLoading}
                    latencyError={analysisLatencyError}
@@ -2593,7 +3333,7 @@ index 58c4cf5..894a7d2 100644
                  {eventsError && <div className={styles.errorBox}>{eventsError}</div>}
                  <RequestEventsDetailsCard
                    events={eventsData}
-@@ -2240,6 +2003,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -2240,6 +2004,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
  
              {credentialSectionVisibility.enabled && (
                <>
@@ -2601,7 +3341,7 @@ index 58c4cf5..894a7d2 100644
                  {credentialsData.error && <div className={styles.errorBox}>{credentialsData.error}</div>}
                  <CredentialProviderFilterBar
                    scope={activeCredentialProviderFilterScope}
-@@ -2300,13 +2064,8 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -2300,13 +2065,8 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
  
              {activeTab === 'settings' && (
                <div className={styles.settingsSections}>
@@ -2617,3 +3357,36 @@ index 58c4cf5..894a7d2 100644
                    apiKeys={apiKeySettings}
                    loading={apiKeySettingsLoading}
                    savingId={apiKeySettingsSavingId}
+@@ -2325,6 +2085,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+                   onNotice={showTopNotice}
+                   loading={pricingLoading}
+                 />
++                <HistoryRetentionSettings />
+               </div>
+             )}
+           </div>
+diff --git a/web/src/pages/test/UsagePage.logic.test.ts b/web/src/pages/test/UsagePage.logic.test.ts
+index a110c45..e68b828 100644
+--- a/web/src/pages/test/UsagePage.logic.test.ts
++++ b/web/src/pages/test/UsagePage.logic.test.ts
+@@ -44,10 +44,10 @@ describe('UsagePage Request Events custom range', () => {
+   const longRange = { unit: 'day' as const, start: '2025-07-18', end: '2026-07-17' };
+   const options = { nowMs: Date.parse('2026-07-17T07:36:42.000Z'), timeZone: 'Asia/Shanghai' };
+ 
+-  it('clamps Request Events to the most recent 90 calendar days', () => {
++  it('keeps one year of daily request history available', () => {
+     expect(getUsageCustomRangeForTab('events', longRange, options)).toEqual({
+       unit: 'day',
+-      start: '2026-04-19',
++      start: '2025-07-18',
+       end: '2026-07-17',
+     });
+   });
+@@ -752,7 +752,6 @@ describe('UsagePage tab labels', () => {
+     expect(labels).toEqual([
+       'translated:usage_stats.tab_overview',
+       'translated:usage_stats.tab_analysis',
+-      'translated:usage_stats.tab_ranking',
+       'translated:usage_stats.tab_events',
+       'translated:usage_stats.tab_auth_files',
+       'translated:usage_stats.tab_ai_provider',

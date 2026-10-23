@@ -10,6 +10,7 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from contextlib import closing
 from pathlib import Path
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
@@ -18,6 +19,7 @@ from failover import ProFailoverGate
 from routing import AccountRouter, RoutingUnavailable, session_identity
 from request_store import RequestStore
 import unified
+import retention
 
 try:
     import requests
@@ -711,6 +713,7 @@ def init_db():
     c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('keeper_usage_event_id','0')")
     c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('last_keeper_usage_sync','0')")
     c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('global_concurrency',?)", (str(GLOBAL_CONCURRENCY),))
+    retention.initialize(c)
     c.close()
     UPSTREAM_QUEUE.router = AccountRouter(db)
 
@@ -1800,6 +1803,8 @@ def main():
     if PRO_FAILOVER_ENABLED:
         FAILOVER_GATE=ProFailoverGate(CPA_CONFIG_PATH,setting_get,setting_set,PRO_FAILOVER_WINDOW_SECONDS)
         FAILOVER_GATE.reconcile()
+    if unified.enabled(unified.namespace(globals())):
+        threading.Thread(target=retention.worker, args=(db, SHUTDOWN_EVENT), name='request-history-retention', daemon=True).start()
     if not GATEWAY_STANDBY:
         threading.Thread(target=metadata_loop,daemon=True).start(); UsageSubscriber().start()
     else:
