@@ -1453,7 +1453,7 @@ index 4296e1d..1ba063a 100644
 +  models: ModelOutputSpeed[]
 +}
 diff --git a/web/src/pages/UsagePage.tsx b/web/src/pages/UsagePage.tsx
-index 58c4cf5..f298a2f 100644
+index 58c4cf5..894a7d2 100644
 --- a/web/src/pages/UsagePage.tsx
 +++ b/web/src/pages/UsagePage.tsx
 @@ -1,7 +1,7 @@
@@ -1818,7 +1818,75 @@ index 58c4cf5..f298a2f 100644
    const {
      requestsSparkline,
      tokensSparkline,
-@@ -1922,30 +1766,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -1896,6 +1740,67 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+   });
+   const dailyAverageCardUsage = getDailyAverageCardUsage(currentOverviewUsage, usage, reserveDailyAverageCard, loading);
+ 
++  const usageControls = (
++    <div className={`${styles.toolbarActionsRight} ${!isEmbeddedInCPAMC ? styles.toolbarActionsRightAnimated : ''}`.trim()}>
++      <div className={isEmbeddedInCPAMC ? styles.toolbarContextSlotImmediate : styles.toolbarContextSlot}>
++        {(!isEmbeddedInCPAMC || showRangeControls) && (
++          /* 普通模式保留筛选区节点以执行过渡；CPAMC 继续按需挂载，维持既有布局。 */
++          <div
++            className={`${styles.usageFilterTransition} ${isEmbeddedInCPAMC ? styles.usageFilterTransitionImmediate : ''} ${showRangeControls ? styles.usageFilterTransitionOpen : ''}`.trim()}
++            aria-hidden={!showRangeControls}
++            inert={!showRangeControls}
++          >
++            <div className={styles.usageFilterTransitionInner}>
++              <div className={styles.usageFilterBar}>
++                <div className={styles.apiKeyFilterGroup}>
++                  <label className={`${styles.usageFilterField} ${styles.apiKeyFilterField}`.trim()}>
++                    <span className={styles.usageFilterLabel}>{t('usage_stats.api_key_filter')}</span>
++                    <Select
++                      value={selectedApiKeyId}
++                      options={apiKeySelectOptions}
++                      onChange={setSelectedApiKeyId}
++                      className={styles.apiKeySelectControl}
++                      ariaLabel={t('usage_stats.api_key_filter')}
++                      fullWidth={false}
++                      dropdownMinWidth={180}
++                    />
++                  </label>
++                </div>
++                <TimeRangeControl
++                  value={timeRange}
++                  customRange={activeCustomRange}
++                  timeZone={rangeTimeZone}
++                  maxCustomDayRangeDays={activeTab === 'events' ? REQUEST_EVENTS_CUSTOM_DAY_RANGE_MAX_DAYS : undefined}
++                  onChange={handleTimeRangeChange}
++                  ariaLabel={t('usage_stats.range_filter')}
++                />
++              </div>
++            </div>
++          </div>
++        )}
++      </div>
++      <div className={styles.usageRefreshSlot}>
++        <div className={styles.usageFilterActions}>
++          <MainActionButton
++            type="button"
++            shellClassName={styles.refreshMainActionShell}
++            className={styles.refreshMainActionButton}
++            onClick={() => void handleManualRefresh().catch(() => {})}
++            disabled={manualRefreshLoading}
++            loading={manualRefreshLoading}
++          >
++            {manualRefreshLoading ? t('common.loading') : (
++              <>
++                <IconRefreshCw size={14} />
++                <span>{t('usage_stats.refresh')}</span>
++              </>
++            )}
++          </MainActionButton>
++        </div>
++      </div>
++    </div>
++  );
++
+   return (
+     <div className={styles.pageShell} data-keeper-page="usage">
+       <div className={styles.pageFrame}>
+@@ -1922,30 +1827,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
                  );
                })}
              </div>
@@ -1849,7 +1917,7 @@ index 58c4cf5..f298a2f 100644
              <MainActionButton
                type="button"
                aria-label={t('common.logout')}
-@@ -1969,27 +1789,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -1969,27 +1850,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
                </div>
              )}
  
@@ -1877,10 +1945,47 @@ index 58c4cf5..f298a2f 100644
  
              {topNotice && (
                <div
-@@ -2072,17 +1871,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
-                     </div>
-                   </div>
-                   )}
+@@ -2035,82 +1895,13 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+                 ))}
+               </div>
+ 
+-              <div className={`${styles.toolbarActionsRight} ${!isEmbeddedInCPAMC ? styles.toolbarActionsRightAnimated : ''}`.trim()}>
+-                <div className={isEmbeddedInCPAMC ? styles.toolbarContextSlotImmediate : styles.toolbarContextSlot}>
+-                  {(!isEmbeddedInCPAMC || showRangeControls) && (
+-                  /* 普通模式保留筛选区节点以执行过渡；CPAMC 继续按需挂载，维持既有布局。 */
+-                  <div
+-                    className={`${styles.usageFilterTransition} ${isEmbeddedInCPAMC ? styles.usageFilterTransitionImmediate : ''} ${showRangeControls ? styles.usageFilterTransitionOpen : ''}`.trim()}
+-                    aria-hidden={!showRangeControls}
+-                    inert={!showRangeControls}
+-                  >
+-                    <div className={styles.usageFilterTransitionInner}>
+-                      <div className={styles.usageFilterBar}>
+-                    <div className={styles.apiKeyFilterGroup}>
+-                    <label className={`${styles.usageFilterField} ${styles.apiKeyFilterField}`.trim()}>
+-                      <span className={styles.usageFilterLabel}>{t('usage_stats.api_key_filter')}</span>
+-                      <Select
+-                        value={selectedApiKeyId}
+-                        options={apiKeySelectOptions}
+-                        onChange={setSelectedApiKeyId}
+-                        className={styles.apiKeySelectControl}
+-                        ariaLabel={t('usage_stats.api_key_filter')}
+-                        fullWidth={false}
+-                        dropdownMinWidth={180}
+-                      />
+-                    </label>
+-                  </div>
+-                    <TimeRangeControl
+-                      value={timeRange}
+-                      customRange={activeCustomRange}
+-                      timeZone={rangeTimeZone}
+-                      maxCustomDayRangeDays={activeTab === 'events' ? REQUEST_EVENTS_CUSTOM_DAY_RANGE_MAX_DAYS : undefined}
+-                      onChange={handleTimeRangeChange}
+-                      ariaLabel={t('usage_stats.range_filter')}
+-                    />
+-                      </div>
+-                    </div>
+-                  </div>
+-                  )}
 -                  {!isEmbeddedInCPAMC && (
 -                    <div
 -                      className={`${styles.rankingScopeTransition} ${showRankingScopeControl ? styles.rankingScopeTransitionOpen : ''}`.trim()}
@@ -1892,10 +1997,29 @@ index 58c4cf5..f298a2f 100644
 -                      </div>
 -                    </div>
 -                  )}
-                 </div>
-                 <div className={styles.usageRefreshSlot}>
-                   <div className={styles.usageFilterActions}>
-@@ -2108,9 +1896,8 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+-                </div>
+-                <div className={styles.usageRefreshSlot}>
+-                  <div className={styles.usageFilterActions}>
+-                    <MainActionButton
+-                      type="button"
+-                      shellClassName={styles.refreshMainActionShell}
+-                      className={styles.refreshMainActionButton}
+-                      onClick={() => void handleManualRefresh().catch(() => {})}
+-                      disabled={manualRefreshLoading}
+-                      loading={manualRefreshLoading}
+-                    >
+-                      {manualRefreshLoading ? t('common.loading') : (
+-                        <>
+-                          <IconRefreshCw size={14} />
+-                          <span>{t('usage_stats.refresh')}</span>
+-                        </>
+-                      )}
+-                    </MainActionButton>
+-                  </div>
+-                </div>
+-              </div>
++              {activeTab !== 'events' && usageControls}
+             </div>
  
              {activeTab === 'overview' && error && <div className={styles.errorBox}>{error === 'AUTH_REQUIRED' ? t('auth.session_expired') : error}</div>}
              {activeTab === 'settings' && pricingError && <div className={styles.errorBox}>{pricingError === 'AUTH_REQUIRED' ? t('auth.session_expired') : pricingError}</div>}
@@ -1906,7 +2030,7 @@ index 58c4cf5..f298a2f 100644
  
              {activeTab === 'overview' && (
                <>
-@@ -2161,46 +1948,17 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -2161,46 +1952,18 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
                    latencyDiagnostics={analysisLatencyData}
                    latencyLoading={analysisLatencyLoading}
                    latencyError={analysisLatencyError}
@@ -1953,10 +2077,11 @@ index 58c4cf5..f298a2f 100644
              {activeTab === 'events' && (
                <>
 +                <QueuePools />
++                {usageControls}
                  {eventsError && <div className={styles.errorBox}>{eventsError}</div>}
                  <RequestEventsDetailsCard
                    events={eventsData}
-@@ -2240,6 +1998,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -2240,6 +2003,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
  
              {credentialSectionVisibility.enabled && (
                <>
@@ -1964,7 +2089,7 @@ index 58c4cf5..f298a2f 100644
                  {credentialsData.error && <div className={styles.errorBox}>{credentialsData.error}</div>}
                  <CredentialProviderFilterBar
                    scope={activeCredentialProviderFilterScope}
-@@ -2300,13 +2059,8 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
+@@ -2300,13 +2064,8 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
  
              {activeTab === 'settings' && (
                <div className={styles.settingsSections}>
